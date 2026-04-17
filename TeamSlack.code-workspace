@@ -1,0 +1,29 @@
+{
+  "folders": [
+    { "path": "apps/slack-bot" },
+    { "path": "services/orchestrator" },
+    { "path": "services/meeting-bot" },
+    { "path": "services/jira-bot" },
+    { "path": "services/review-bot" },
+    { "path": "shared/model-gateway" },
+    { "path": "shared/profile" },
+    { "path": "shared/audit-log" },
+    { "path": "docs" },
+    { "path": "scripts" }
+  ],
+  "settings": {
+    "files.exclude": {
+      "**/.env": true,
+      "**/*.private.md": true
+    },
+    "python.linting.enabled": true,
+    "python.linting.pylintEnabled": true,
+    "python.formatting.provider": "black",
+    "[python]": {
+      "editor.formatOnSave": true,
+      "editor.codeActionsOnSave": {
+        "source.organizeImports": "explicit"
+      }
+    }
+  }
+}
