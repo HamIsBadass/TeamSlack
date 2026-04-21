@@ -185,39 +185,28 @@ class UserProfile(Base):
 
 # ============ Database initialization ============
 
-def init_db(database_url: str):
-    """
-    Initialize database and create all tables.
-    
-    Args:
-        database_url: PostgreSQL URL (e.g., postgresql://user:pass@localhost/db)
-    """
-    engine = create_engine(database_url)
-    Base.metadata.create_all(engine)
-    print(f"Database initialized at {database_url}")
-    return engine
-    _engine = None
-    _SessionLocal = None
+_engine = None
+_SessionLocal = None
 
 
 def init_db(database_url: str):
     """
     Initialize database and create all tables.
-    
+
     Args:
         database_url: PostgreSQL URL (e.g., postgresql://user:pass@localhost/db)
-    
+
     Returns:
         SQLAlchemy engine instance
     """
     global _engine, _SessionLocal
-    
+
     from sqlalchemy.orm import sessionmaker
-    
+
     _engine = create_engine(database_url, echo=False)
     Base.metadata.create_all(_engine)
     _SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=_engine)
-    
+
     print(f"✓ Database initialized: {database_url}")
     return _engine
 
