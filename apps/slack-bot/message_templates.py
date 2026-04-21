@@ -89,43 +89,147 @@ def orchestration_parent_message(
 def approval_message(
     request_id: str,
     summary: str,
-    warnings: List[str]
+    warnings: List[str],
+    api_cost_footer: str = ""
 ) -> Dict[str, Any]:
     """
-    Create approval request message.
+    Create approval request message with Block Kit buttons.
     
     Shows:
     - Summary of what's being approved (key details from drafts)
     - Any warnings/flags (missing fields, duplicates, etc.)
     - Buttons: Approve, Request Changes, Cancel
+    - API cost footer (if provided)
     - Timeout warning: "Expires in 10 minutes"
     
     Args:
         request_id: Request UUID
         summary: Summary text from review-bot (markdown)
         warnings: List of warning messages (empty if none)
+        api_cost_footer: Cost summary text (e.g., "💰 $0.005 | 오늘: $0.15")
     
     Returns:
-        Block Kit payload dict
+        List of Block Kit block dicts (ready for Slack API)
     """
     logger.info(f"Creating approval message for {request_id}")
     
-    # TODO: Build Block Kit message with:
-    # - Header: "🟡 승인 대기"
-    # - Section: summary text (markdown)
-    # - Divider
-    # - Section: warnings (if any) with ⚠️ emoji
-    # - Divider
-    # - Actions: Approve button, Request Changes button, Cancel button
-    # - Context: "승인하지 않으면 10분 후 자동 취소됩니다"
+    short_id = str(request_id)[:8]
+    blocks = []
     
-    return {
+    # Header
+    blocks.append({
+        "type": "header",
+        "text": {
+            "type": "plain_text",
+            "text": f"🟡 승인 대기: 요청 #{short_id}",
+            "emoji": True
+        }
+    })
+    
+    # Summary section
+    blocks.append({
         "type": "section",
         "text": {
             "type": "mrkdwn",
-            "text": f"🟡 요청 #{str(request_id)[:8]}를 검토하고 승인해주세요"
+            "text": f"*산출물 요약*\n{summary or '요약 없음'}"
         }
-    }
+    })
+    
+    # Warnings section (if any)
+    if warnings:
+        warning_text = "\n".join([f"⚠️ {w}" for w in warnings])
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*경고 사항*\n{warning_text}"
+            }
+        })
+    
+    # Divider
+    blocks.append({"type": "divider"})
+    
+    # Action buttons
+    blocks.append({
+        "type": "actions",
+        "elements": [
+            {
+                "type": "button",
+                "text": {
+                    "type": "plain_text",
+                    "text": "✅ Approve",
+                    "emoji": True
+                },
+                "value": request_id,
+                "action_id": f"approval_approve_{request_id}",
+                "style": "primary"  # Green
+            },
+            {
+                "type": "button",
+                "text": {
+                    "type": "plain_text",
+                    "text": "🔄 Request Changes",
+                    "emoji": True
+                },
+                "value": request_id,
+                "action_id": f"approval_revision_{request_id}",
+                "style": "danger"  # Red
+            },
+            {
+                "type": "button",
+                "text": {
+                    "type": "plain_text",
+                    "text": "❌ Cancel",
+                    "emoji": True
+                },
+                "value": request_id,
+                "action_id": f"approval_cancel_{request_id}",
+                "confirm": {
+                    "title": {
+                        "type": "plain_text",
+                        "text": "정말 취소하시겠습니까?"
+                    },
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"요청 #{short_id}를 취소하면 복구할 수 없습니다."
+                    },
+                    "confirm": {
+                        "type": "plain_text",
+                        "text": "네, 취소합니다"
+                    },
+                    "deny": {
+                        "type": "plain_text",
+                        "text": "아니요"
+                    }
+                }
+            }
+        ]
+    })
+    
+    # Cost footer (if provided)
+    if api_cost_footer:
+        blocks.append({
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": api_cost_footer
+                }
+            ]
+        })
+    
+    # Timeout warning
+    blocks.append({
+        "type": "context",
+        "elements": [
+            {
+                "type": "mrkdwn",
+                "text": "⏰ 승인하지 않으면 10분 후 자동으로 취소됩니다."
+            }
+        ]
+    })
+    
+    return blocks
 
 
 def completion_message(

@@ -136,6 +136,130 @@ async def list_user_requests(user_id: str, limit: int = 20):
     return JSONResponse(result)
 
 
+@app.post("/api/orchestrator/submit")
+async def submit_worker_output(request: Request):
+    """
+    Worker bot submission endpoint.
+    
+    Personal bots, meeting bots, Jira bots, or review bots submit their outputs here.
+    Orchestrator validates schema, normalizes format, and schedules next steps.
+    
+    Request body:
+    {
+        "source_bot": "meeting_bot" | "jira_bot" | "review_bot" | "personal_bot",
+        "request_id": "550e8400-...",  # Optional: link to existing request
+        "source_user": "U123456789",    # Slack user ID
+        "output_type": "meeting_summary" | "jira_draft" | "quality_review" | "query_response",
+        "payload": {
+            "title": "...",
+            "summary": "...",
+            "content": {...},
+            ...
+        },
+        "api_cost_usd": 0.005,  # Actual or estimated cost
+        "api_name": "perplexity_research" | "gemini_pro" | etc.
+    }
+    
+    Returns:
+        {
+            "ack": True,
+            "request_id": "550e8400-...",  # New or existing
+            "status": "RECEIVED" | "VALIDATION_FAILED",
+            "chain_step": "NEXT_STEP_NAME",
+            "message": "..."
+        }
+    """
+    logger.info("Worker bot submission received")
+    
+    body = await request.json()
+    
+    source_bot = (body.get("source_bot") or "").strip()
+    request_id = (body.get("request_id") or "").strip()
+    source_user = (body.get("source_user") or "").strip()
+    output_type = (body.get("output_type") or "").strip()
+    payload = body.get("payload") or {}
+    api_cost_usd = float(body.get("api_cost_usd") or 0)
+    api_name = (body.get("api_name") or "").strip()
+    
+    # Validate input
+    if not all([source_bot, source_user, output_type, payload]):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "ack": False,
+                "error": "missing_fields",
+                "message": "Required: source_bot, source_user, output_type, payload"
+            }
+        )
+    
+    # TODO: Validate payload schema against output_type
+    # - meeting_summary: requires title, summary, participants, action_items
+    # - jira_draft: requires title, description, fields
+    # - quality_review: requires findings, score, recommendations
+    # - query_response: requires answer, sources, model
+    
+    # If no request_id, create new request
+    if not request_id:
+        result = orchestrator.receive_request(
+            user_id=source_user,
+            tenant_id="DEFAULT",
+            raw_text=f"[{source_bot}] {output_type}: {payload.get('title', '...')}"
+        )
+        request_id = result["request_id"]
+        logger.info(f"Created new request {request_id}")
+    
+    # Record API cost if provided
+    if api_cost_usd > 0 and api_name:
+        from shared.api_cost_tracker import get_cost_tracker
+        tracker = get_cost_tracker()
+        cost_info = tracker.record_api_call(
+            api_name=api_name,
+            cost_or_tokens=api_cost_usd,
+            user_id=source_user,
+            request_id=request_id,
+            metadata={"source_bot": source_bot, "output_type": output_type}
+        )
+        logger.info(f"Cost recorded: {cost_info}")
+    
+    # Store worker output in orchestrator
+    ok = orchestrator.store_worker_output(
+        request_id=request_id,
+        source_bot=source_bot,
+        output_type=output_type,
+        payload=payload,
+        api_cost_usd=api_cost_usd,
+        api_name=api_name
+    )
+    
+    if not ok:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "ack": False,
+                "error": "storage_failed",
+                "request_id": request_id,
+                "message": "Failed to store output"
+            }
+        )
+    
+    # Route to next step based on output type
+    req_status = orchestrator.get_request_status(request_id)
+    next_step = orchestrator.route_to_next_step(request_id, source_bot, output_type)
+    
+    logger.info(f"Request {request_id} routed to {next_step}")
+    
+    return JSONResponse(
+        status_code=202,  # Accepted
+        content={
+            "ack": True,
+            "request_id": request_id,
+            "status": req_status.get("status") if req_status else "UNKNOWN",
+            "chain_step": next_step or "WAITING_APPROVAL",
+            "message": f"Output accepted from {source_bot}"
+        }
+    )
+
+
 @app.get("/api/health")
 async def health_check():
     """

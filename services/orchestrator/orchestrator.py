@@ -420,6 +420,73 @@ class Orchestrator:
                 "requests": deepcopy(sliced),
             }
 
+    def store_worker_output(
+        self,
+        request_id: str,
+        source_bot: str,
+        output_type: str,
+        payload: Dict[str, Any],
+        api_cost_usd: float = 0.0,
+        api_name: str = "",
+    ) -> bool:
+        """Store output produced by a worker bot and track API cost."""
+        logger.info(f"Storing output from {source_bot} for request {request_id}")
+
+        with self._lock:
+            req = self._requests.get(request_id)
+            if not req:
+                return False
+
+            now = datetime.utcnow().isoformat()
+
+            worker_outputs = req.setdefault("worker_outputs", [])
+            worker_outputs.append(
+                {
+                    "source_bot": source_bot,
+                    "output_type": output_type,
+                    "payload": payload,
+                    "api_cost_usd": api_cost_usd,
+                    "api_name": api_name,
+                    "received_at": now,
+                }
+            )
+
+            req["total_api_cost_usd"] = req.get("total_api_cost_usd", 0.0) + api_cost_usd
+            req["updated_at"] = now
+            req["logs"].append(
+                {
+                    "level": "INFO",
+                    "message": f"Output received from {source_bot}: {output_type}",
+                    "created_at": now,
+                }
+            )
+
+            return True
+
+    def route_to_next_step(
+        self,
+        request_id: str,
+        source_bot: str,
+        output_type: str,
+    ) -> Optional[str]:
+        """Advance request status based on the completed worker output."""
+        logger.info(f"Routing {request_id} after {source_bot}/{output_type}")
+
+        routing_map = {
+            ("meeting_bot", "meeting_summary"): "JIRA_DRAFTED",
+            ("jira_bot", "jira_draft"): "REVIEW_DONE",
+            ("review_bot", "quality_review"): "WAITING_APPROVAL",
+            ("personal_bot", "query_response"): "DONE",
+        }
+
+        next_status = routing_map.get((source_bot, output_type))
+        if not next_status:
+            logger.warning(f"Unknown routing: {source_bot}/{output_type}")
+            return None
+
+        self.update_status(request_id, next_status)
+        return next_status
+
 
 # ============ Background tasks ============
 
