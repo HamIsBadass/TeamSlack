@@ -4,13 +4,28 @@
 
 ## 🎯 프로젝트 개요
 
-TeamSlack은 Slack DM을 통해 회의 내용을 입력받고, 다음의 3단계 워크플로우를 자동으로 실행합니다:
+TeamSlack은 Slack DM을 통해 회의 내용을 입력받고, 다음의 3단계 워크플로우를 실행하는 것을 목표로 설계되었다.
 
-1. **Meeting Bot** 📝 - 회의 내용 파싱 및 요약
-2. **Jira Bot** ✅ - 액션 아이템을 Jira 이슈 드래프트로 변환
-3. **Review Bot** 🔍 - 생성된 이슈의 품질 검수 및 중복 확인
+1. **Meeting Bot** — 회의 내용 파싱 및 요약
+2. **Jira Bot** — 액션 아이템을 Jira 이슈 드래프트로 변환
+3. **Review Bot** — 생성된 이슈의 품질 검수 및 중복 확인
 
-모든 진행 상황은 **오케스트레이션 채널**에서 실시간 가시화되며, 최종 승인 단계에서 사용자 피드백을 반영합니다.
+모든 진행 상황은 **오케스트레이션 채널**에서 가시화되며, 최종 승인 단계에서 사용자 피드백을 반영한다.
+
+### 현재 구현 상태 (2026-04-20)
+
+| 영역 | 상태 |
+|------|------|
+| Slack 어댑터 + Socket Mode runner | 동작 (DM → 오케스트레이션 채널 루트 메시지 + 스레드 업데이트) |
+| Orchestrator 상태머신 + 승인 흐름 | 동작 (in-memory dict 저장, 재시작 시 유실) |
+| `/api/orchestrator/submit` 엔드포인트 | 동작 |
+| Block Kit 승인 메시지 + API 비용 추적 | 동작 |
+| Meeting / Jira / Review worker 봇 | **TODO 스텁** — 실제 LLM 호출 미구현 |
+| `shared/model-gateway` | **Stub 응답 반환** |
+| Celery 태스크 | **decorator 0개** |
+| PostgreSQL 영속화 | **모델만 정의, 미연결** |
+
+자세한 변경 이력은 [CHANGELOG.md](./CHANGELOG.md) 참조.
 
 ## 📋 PoC 구조
 
@@ -83,10 +98,15 @@ venv\Scripts\activate.bat     # Windows cmd
 pip install -r requirements.txt
 
 # FastAPI 서버 실행 (터미널 1)
-python -m uvicorn apps.slack-bot.main:app --reload --port 8000
+# 주의: 디렉터리명에 하이픈(-)이 있어 Python 모듈 import가 안 됨.
+# 현재는 스크립트로 직접 실행한다.
+python apps/slack-bot/main.py
 
-# Celery Worker 실행 (터미널 2)
-celery -A services.orchestrator.tasks worker --loglevel=info
+# Socket Mode runner (터미널 2)
+python apps/slack-bot/socket_mode_runner.py
+
+# Celery Worker — 현재 태스크 데코레이터 없음 (Phase 5 대상)
+# celery -A services.orchestrator.tasks worker --loglevel=info
 
 # Redis 실행 (Docker 또는 WSL2)
 docker run -d -p 6379:6379 redis:7-alpine
@@ -99,18 +119,11 @@ docker run -d -p 5432:5432 \
   postgres:15
 ```
 
-## 📚 핵심 문서
+## 📚 문서
 
-| 문서 | 내용 |
-|------|------|
-| [SETUP_GUIDE.md](./SETUP_GUIDE.md) | **[필독]** Python/Docker 환경 설정 (4가지 옵션) |
-| [state-machine.md](./docs/state-machine.md) | 요청 라이프사이클: 10개 상태 + Mermaid 다이어그램 |
-| [db-schema.md](./docs/db-schema.md) | 데이터베이스 설계: ERD + 5개 테이블 정의 |
-| [test-scenarios.md](./docs/test-scenarios.md) | 8개 E2E 테스트 시나리오 (정상/재시도/타임아웃 등) |
-| [approval-policy.md](./docs/approval-policy.md) | 재시도 및 타임아웃 정책 |
-| [DOCKER_GUIDE.md](./docs/DOCKER_GUIDE.md) | Docker Compose, K8s, AWS ECS 배포 |
-| [orchestrator-bot-style.md](./docs/guides/orchestrator-bot-style.md) | 오케스트레이터 봇 스타일 규칙 및 수정 포인트 |
-| [personal-bot-style.md](./docs/guides/personal-bot-style.md) | 개인봇 스타일 규칙 및 수정 포인트 |
+- **[SETUP_GUIDE.md](./SETUP_GUIDE.md)** — Python/Docker 환경 설정 (필독)
+- **[CHANGELOG.md](./CHANGELOG.md)** — 변경 이력
+- **[docs/README.md](./docs/README.md)** — 전체 문서 인덱스 (상태머신, DB 스키마, 배포, 봇 스타일 가이드 등)
 
 ## 🔧 기술 스택
 
@@ -264,14 +277,14 @@ PARSING   ├─→ MEETING_DONE
 7. **최종 승인** → 사용자 버튼 클릭 → 상태 = `DONE`
 8. **결과 전달** → DM으로 Jira 링크 + 요약 전송
 
-## 📈 PoC 검증 기준
+## 📈 PoC 검증 기준 (목표)
 
-- ✅ 요청부터 결과까지 < 5분 (LLM 포함)
-- ✅ 사용자 페르소나별 다양한 포맷 (PM / Developer / Designer / Concise)
-- ✅ 중복 요청 자동 필터링 (Idempotency)
-- ✅ 재시도 정책: 3회 시도 + exponential backoff
-- ✅ 모든 진행 상황 Slack에서 실시간 추적 가능
-- ✅ BYOK 준비 (사용자별 API 키 관리)
+- [ ] 요청부터 결과까지 < 5분 (LLM 포함) — worker 미구현이라 미측정
+- [x] 사용자 페르소나 스타일 정의 (PM / Developer / Designer / Concise) — `shared/profile`에 스키마만
+- [ ] 중복 요청 자동 필터링 (Idempotency) — 미구현
+- [ ] 재시도 정책: 3회 시도 + exponential backoff — 미구현
+- [x] DM 요청이 오케스트레이션 채널 스레드에 실시간 반영
+- [ ] BYOK (사용자별 API 키) — 스캐폴딩만, 실제 키 로딩 경로 미연결
 
 ## 🐛 트러블슈팅
 
