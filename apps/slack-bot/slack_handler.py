@@ -6,10 +6,14 @@ Routes incoming messages, button clicks, and modals.
 """
 
 import logging
+import os
 import sys
 import re
 from typing import Dict, Any, Optional
 from pathlib import Path
+
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
@@ -27,6 +31,18 @@ class SlackHandler:
         """Initialize Slack Bolt app and register handlers."""
         logger.info("Initializing SlackHandler")
         self.orchestrator = Orchestrator()
+        self.orchestration_channel_id = os.getenv("SLACK_ORCHESTRA_CHANNEL_ID", "").strip()
+        self.orchestration_bot_user_id = os.getenv("SLACK_ORCHESTRA_BOT_USER_ID", "").strip()
+        self.slack_client: Optional[WebClient] = None
+
+        bot_token = os.getenv("SLACK_BOT_TOKEN", "").strip()
+        if bot_token:
+            try:
+                self.slack_client = WebClient(token=bot_token)
+            except Exception:
+                logger.exception("Failed to initialize Slack WebClient for orchestration relay")
+
+        self.orchestrator.slack_notifier = self._handle_orchestrator_event
         
         # TODO: Initialize Slack Bolt app
         # from slack_bolt import App
@@ -78,12 +94,96 @@ class SlackHandler:
             raw_text=text,
         )
 
+        try:
+            thread_ts = self._notify_orchestration_channel(
+                request={
+                    **result,
+                    "user_id": user_id,
+                    "raw_text": text,
+                }
+            )
+            if thread_ts:
+                self.orchestrator.attach_slack_context(
+                    request_id=result["request_id"],
+                    channel_id=self.orchestration_channel_id,
+                    thread_ts=thread_ts,
+                )
+        except Exception:
+            logger.exception("Failed to relay request to orchestration channel")
+
         return {
             "ack": True,
             "request_id": result["request_id"],
             "status": result["status"],
             "trace_id": result["trace_id"],
         }
+
+    def _notify_orchestration_channel(self, request: Dict[str, Any]) -> str:
+        """Post the incoming request into the orchestration channel for visibility."""
+        if not self.slack_client or not self.orchestration_channel_id:
+            return ""
+
+        request_id = (request.get("request_id") or "").strip()
+        user_id = (request.get("user_id") or "").strip()
+        trace_id = (request.get("trace_id") or "").strip()
+        raw_text = re.sub(r"\s+", " ", (request.get("raw_text") or "").strip())
+        preview = raw_text[:300]
+        if len(raw_text) > 300:
+            preview = preview.rstrip() + "..."
+
+        bot_prefix = f"<@{self.orchestration_bot_user_id}> " if self.orchestration_bot_user_id else ""
+        root_text = (
+            f"{bot_prefix}<@{user_id}> 요청 1건\n"
+            f"request_id: {request_id[:8]}\n"
+            f"trace_id: {trace_id[:8]}\n"
+            f"status: {request.get('status', 'RECEIVED')}\n"
+            f"내용: {preview or '내용 없음'}"
+        )
+
+        response = self.slack_client.chat_postMessage(
+            channel=self.orchestration_channel_id,
+            text=root_text,
+        )
+        thread_ts = (response.get("ts") or "").strip()
+        if not thread_ts:
+            return ""
+
+        self.slack_client.chat_postMessage(
+            channel=self.orchestration_channel_id,
+            thread_ts=thread_ts,
+            text="오케스트레이터: 요청을 확인했다. PARSING 단계로 넘긴다.",
+        )
+
+        return thread_ts
+
+    def _handle_orchestrator_event(self, event_type: str, request: Dict[str, Any]) -> None:
+        """Route orchestrator events into the stored Slack thread."""
+        if event_type == "approval_requested":
+            self.send_approval_request(
+                user_id=(request.get("user_id") or "").strip(),
+                request_id=(request.get("request_id") or "").strip(),
+                summary=self._build_request_summary(request),
+                warnings=self._build_request_warnings(request),
+            )
+            return
+
+        self.update_orchestration_message(
+            request_id=(request.get("request_id") or "").strip(),
+            status=(request.get("status") or "").strip(),
+            current_step=(request.get("current_step") or "").strip(),
+        )
+
+    def _build_request_summary(self, request: Dict[str, Any]) -> str:
+        raw_text = (request.get("raw_text") or "").strip()
+        if not raw_text:
+            return "요청 요약 없음"
+        return re.sub(r"\s+", " ", raw_text)[:400]
+
+    def _build_request_warnings(self, request: Dict[str, Any]) -> list[str]:
+        warnings: list[str] = []
+        if (request.get("status") or "").strip() == "WAITING_APPROVAL":
+            warnings.append("Jira 쓰기 후보가 승인 대기 상태다.")
+        return warnings
 
     def handle_button_action(
         self,
@@ -205,11 +305,33 @@ class SlackHandler:
             True if successful
         """
         logger.info(f"Updating orchestration message for {request_id}")
-        
-        # TODO: Find existing parent message (via message_ts stored in requests table)
-        # TODO: Update message blocks with new status
-        # TODO: Post new log to thread
-        
+
+        if not self.slack_client:
+            return False
+
+        request = self.orchestrator.get_request_status(request_id)
+        if not request:
+            return False
+
+        channel_id = (request.get("slack_channel_id") or self.orchestration_channel_id or "").strip()
+        thread_ts = (request.get("slack_thread_ts") or "").strip()
+        if not channel_id or not thread_ts:
+            return False
+
+        short_id = request_id[:8]
+        status_text = status or request.get("status", "UNKNOWN")
+        step_text = current_step or request.get("current_step", "UNKNOWN")
+        message = (
+            f"상태 업데이트: 요청 #{short_id}\n"
+            f"status: {status_text}\n"
+            f"step: {step_text}"
+        )
+        self.slack_client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text=message,
+        )
+
         return True
 
     def send_approval_request(
@@ -234,11 +356,34 @@ class SlackHandler:
             True if successful
         """
         logger.info(f"Sending approval request for {request_id}")
-        
-        # TODO: Build Block Kit message
-        # TODO: Post to orchestration channel
-        # TODO: Store message_ts in requests table for later reference
-        
+
+        if not self.slack_client:
+            return False
+
+        request = self.orchestrator.get_request_status(request_id)
+        if not request:
+            return False
+
+        channel_id = (request.get("slack_channel_id") or self.orchestration_channel_id or "").strip()
+        thread_ts = (request.get("slack_thread_ts") or "").strip()
+        if not channel_id or not thread_ts:
+            return False
+
+        warning_text = "\n".join(f"• {item}" for item in warnings) if warnings else "• 특이 경고 없음"
+        approval_text = (
+            f"🟡 승인 대기\n"
+            f"요청 #{request_id[:8]}\n"
+            f"요약: {summary}\n"
+            f"경고:\n{warning_text}\n\n"
+            "승인하려면 `Approve`, 수정이 필요하면 `Request Changes`, 중단하려면 `Cancel` 버튼을 사용한다."
+        )
+
+        self.slack_client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text=approval_text,
+        )
+
         return True
 
 

@@ -23,9 +23,37 @@ class Orchestrator:
         logger.info("Initializing Orchestrator")
         self._lock = RLock()
         self._requests: Dict[str, Dict[str, Any]] = {}
+        self.slack_notifier = None
         
         # PoC stage: in-memory storage for rapid iteration.
         # Next stage: switch to PostgreSQL + Redis + Celery-backed storage.
+
+    def _notify_slack(self, event_type: str, request_id: str) -> None:
+        """Emit a request event to the Slack layer if a notifier is registered."""
+        notifier = self.slack_notifier
+        if not notifier:
+            return
+
+        snapshot = self.get_request_status(request_id)
+        if not snapshot:
+            return
+
+        try:
+            notifier(event_type, snapshot)
+        except Exception:
+            logger.exception("Slack notifier failed for %s", event_type)
+
+    def attach_slack_context(self, request_id: str, channel_id: str, thread_ts: str) -> bool:
+        """Store Slack thread metadata for later status updates."""
+        with self._lock:
+            req = self._requests.get(request_id)
+            if not req:
+                return False
+
+            req["slack_channel_id"] = channel_id
+            req["slack_thread_ts"] = thread_ts
+            req["updated_at"] = datetime.utcnow().isoformat()
+            return True
 
     def receive_request(
         self,
@@ -69,6 +97,8 @@ class Orchestrator:
                 "raw_text": raw_text,
                 "status": "RECEIVED",
                 "current_step": "PARSING",
+                "slack_channel_id": "",
+                "slack_thread_ts": "",
                 "created_at": created_at.isoformat(),
                 "updated_at": created_at.isoformat(),
                 "expires_at": expires_at.isoformat(),
@@ -196,7 +226,12 @@ class Orchestrator:
             }
             req["current_step"] = status_to_step.get(new_status, req.get("current_step", "PARSING"))
 
-            return True
+        if new_status == "WAITING_APPROVAL":
+            self._notify_slack("approval_requested", request_id)
+        else:
+            self._notify_slack("status_updated", request_id)
+
+        return True
 
     def handle_approval(
         self,
@@ -255,7 +290,15 @@ class Orchestrator:
                     "created_at": now,
                 }
             )
-            return True
+
+        if normalized == "APPROVED":
+            self._notify_slack("request_completed", request_id)
+        elif normalized in ("REJECTED", "REQUEST_REVISION"):
+            self._notify_slack("request_revision", request_id)
+        elif normalized == "CANCELED":
+            self._notify_slack("request_canceled", request_id)
+
+        return True
 
     def handle_failure(
         self,
