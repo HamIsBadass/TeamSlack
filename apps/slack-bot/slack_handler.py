@@ -19,10 +19,6 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from message_templates import (
-    ORCHESTRATOR_APPROVAL_HELP,
-    ORCHESTRATOR_REQUEST_RECEIVED,
-)
 from services.orchestrator.orchestrator import Orchestrator
 from shared.profile import Persona, get_persona
 
@@ -230,7 +226,7 @@ class SlackHandler:
         self._post_to_channel(
             channel_id=self.orchestration_channel_id,
             user_id=user_id,
-            text=f"{orchestrator_persona.header_label()}\n{ORCHESTRATOR_REQUEST_RECEIVED}",
+            text=f"{orchestrator_persona.header_label()}\n요청을 확인했다. PARSING 단계로 넘긴다곰.",
             thread_ts=thread_ts,
             visibility="ephemeral",
         )
@@ -466,7 +462,7 @@ class SlackHandler:
             f"🟡 승인 대기: 요청 #{request_id[:8]}\n"
             f"요약: {summary}\n"
             f"경고:\n{warning_text}\n\n"
-            f"{ORCHESTRATOR_APPROVAL_HELP}"
+            "승인하려면 `Approve`, 수정이 필요하면 `Request Changes`, 중단하려면 `Cancel` 버튼을 사용한다곰."
         )
         # Approval buttons must be ephemeral to the requester only — others must
         # not be able to click approve on someone else's request.
