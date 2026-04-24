@@ -18,10 +18,12 @@
 
 ## 봇 스타일 & 기능 가이드
 
+- [guides/bot-common-voice.md](guides/bot-common-voice.md) — 모든 봇 공통 음성 규칙(상위 지침)
 - [guides/orchestrator-bot-style.md](guides/orchestrator-bot-style.md) — 오케스트레이터 봇 페르소나 규칙
 - [guides/personal-bot-style.md](guides/personal-bot-style.md) — 개인 봇 페르소나 규칙
 - [guides/reply-implementation-guide.md](guides/reply-implementation-guide.md), [guides/reply-command-tech-review.md](guides/reply-command-tech-review.md), [guides/reply-shortcut-setup.md](guides/reply-shortcut-setup.md) — 답장 기능
 - [guides/psearch-guideline-management.md](guides/psearch-guideline-management.md) — PSearch 가이드라인
+- [guides/api-cost-monitoring.md](guides/api-cost-monitoring.md) — API 사용량·비용 확인(슬랙 /cost + 대시보드)
 - [guides/notion-api-field-operations.md](guides/notion-api-field-operations.md) — Notion 연동
 
 ## Notion 템플릿

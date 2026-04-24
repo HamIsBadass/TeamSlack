@@ -1,0 +1,10 @@
+{
+  "default": {
+    "display_name": "기본",
+    "birth_year": 1997,
+    "birth_date": "1997-10-05",
+    "zodiac_ko": "소띠(정축생)",
+    "zodiac_western": "천칭자리",
+    "ilgan": "庚"
+  }
+}

@@ -2,9 +2,11 @@
 
 이 문서는 현재 코드 기준으로 `/psearch` 모델 라우팅, 응답 스타일, 운영 절차를 빠르게 확인하기 위한 문서입니다.
 
+> **2026-04-21 이전 구조**: `/psearch` 는 오케스트레이터(apps/slack-bot) 러너에 있었다. 이후 개인봇으로 이전됨. 본 문서의 경로는 개인봇 기준.
+
 ## 1) 실제 동작 구조
 
-- Slash command 진입점: [apps/slack-bot/socket_mode_runner.py](apps/slack-bot/socket_mode_runner.py)
+- Slash command 진입점: [apps/personal-bot/socket_mode_runner.py](apps/personal-bot/socket_mode_runner.py)
 - Perplexity 호출: `_perplexity_search(...)`
 - 모델 라우팅: [shared/utils/model_router.py](shared/utils/model_router.py)
   - `parse_psearch_input(...)`
@@ -53,9 +55,9 @@
 | 수정 목적 | 파일 | 핵심 함수/상수 |
 |---|---|---|
 | 모델 선택 규칙 변경 | [shared/utils/model_router.py](shared/utils/model_router.py) | `select_perplexity_model`, `parse_psearch_input` |
-| 말투/출력 지침 변경 | [apps/slack-bot/socket_mode_runner.py](apps/slack-bot/socket_mode_runner.py) | `SYSTEM_PROMPT_*` |
+| 말투/출력 지침 변경 | [apps/personal-bot/socket_mode_runner.py](apps/personal-bot/socket_mode_runner.py) | `SYSTEM_PROMPT_*` |
 | Slack 서식 동기화 | [shared/utils/slack_formatter.py](shared/utils/slack_formatter.py) | `to_slack_format` |
-| 길이 제한 변경 | [apps/slack-bot/socket_mode_runner.py](apps/slack-bot/socket_mode_runner.py) | `content[:2800]` |
+| 길이 제한 변경 | [apps/personal-bot/socket_mode_runner.py](apps/personal-bot/socket_mode_runner.py) | `content[:2800]` |
 
 스타일 문서 참조:
 
@@ -76,7 +78,7 @@
 1. 문법 검사
 
 ```bash
-python -m py_compile apps/slack-bot/socket_mode_runner.py
+python -m py_compile apps/personal-bot/socket_mode_runner.py
 python -m py_compile shared/utils/model_router.py
 python -m py_compile shared/utils/slack_formatter.py
 ```
@@ -84,7 +86,7 @@ python -m py_compile shared/utils/slack_formatter.py
 2. 봇 실행
 
 ```bash
-python apps/slack-bot/socket_mode_runner.py
+python apps/personal-bot/socket_mode_runner.py
 ```
 
 3. Slack 테스트
@@ -108,7 +110,7 @@ python apps/slack-bot/socket_mode_runner.py
 `/usdtw`는 두 가지 모드로 동작합니다.
 
 - 기본 모드: `/usdtw`
-  - 현재 USD/KRW 환율 + 6개월 관점 의견
+  - 현재 USD/KRW 환율 + 6개월 관점 의견 (아래 §6-1 형식 고정)
 - 변환 모드: `/usdtw [금액][화폐]` 또는 `/usdtw [금액] [화폐]`
   - 한 줄 형식으로 KRW 환산값 반환
 
@@ -127,3 +129,35 @@ python apps/slack-bot/socket_mode_runner.py
 ```text
 지금 기준으로 0.1달러는 약 147.8원이다곰.:polar_bear:
 ```
+
+### 6-1) 환율 질문 답변 형식 (고정)
+
+다음 경로는 **완전히 동일한 2줄 포맷**을 공유합니다.
+
+- `/usdtw` 기본 모드 (`/usdtw` 만 입력)
+- 쥐피티 DM/멘션 내 환율 의도 질문 (키워드: `환율`, `원달러`, `달러`, `usd`, `krw`)
+
+**출력 형식(예외 없음):**
+
+```text
+지금 기준으로 1달러는 약 NNN원이다! :hamster:
+최근 6개월 흐름 기준으로 현재가 {고점|저점|중간} 구간이다!
+```
+
+**규칙:**
+
+1. **2줄 초과 금지.** 서론·부연·출처 표기(`[1]`, `[2]` 등) 모두 출력하지 않는다.
+2. **데이터 소스:** Perplexity Finance 데이터베이스 기준 최신 시장 수치만 사용.
+3. **1번째 줄:** 반드시 `지금 기준으로 1달러는 약 NNN원이다!` 형식 + 문단 말미에 `:hamster:`.
+4. **2번째 줄:** 최근 6개월 환율 흐름을 기준으로 현재 시점이 고점/저점/중간 중 어디인지 한 줄 평가. 문장은 `~다!`로 끝낸다.
+
+**구현 지점:**
+
+- 공용 시스템 프롬프트: [apps/personal-bot/socket_mode_runner.py](../../apps/personal-bot/socket_mode_runner.py) `SYSTEM_PROMPT_EXCHANGE_RATE`
+- DM 자동 분기: `_perplexity_system_prompt_for_query()` → 환율 의도면 `SYSTEM_PROMPT_EXCHANGE_RATE` 리턴
+- 환율 의도 판정: `_is_exchange_rate_query()` (키워드 기반)
+- `/usdtw` 기본 모드: `handle_usdtw()` 내부에서 동일 상수 사용
+
+형식 변경이 필요하면 **`SYSTEM_PROMPT_EXCHANGE_RATE` 한 곳만 수정**하면 `/usdtw` 와 DM 환율 질문 모두에 즉시 반영된다.
+
+> 변환 모드(`/usdtw 10달러`)는 1줄 KRW 환산 포맷이므로 별도 경로. `SYSTEM_PROMPT_USDTW` 유지.

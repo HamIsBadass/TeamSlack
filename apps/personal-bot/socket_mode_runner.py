@@ -6,6 +6,7 @@ import re
 import json
 import time
 import logging
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from uuid import uuid4
@@ -27,6 +28,100 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
 from shared.utils import parse_psearch_input, select_perplexity_model, select_gemini_model, to_slack_format
+from shared.profile import get_persona
+from shared.api_cost_tracker import get_cost_tracker
+
+import fortune_engine  # noqa: E402  — same-directory module
+import hanriver_engine  # noqa: E402  — same-directory module
+import ktx_engine  # noqa: E402  — same-directory module
+import realestate_engine  # noqa: E402  — same-directory module
+import srt_engine  # noqa: E402  — same-directory module
+import stock_engine  # noqa: E402  — same-directory module
+import subway_engine  # noqa: E402  — same-directory module
+
+_COST_TRACKER = get_cost_tracker()
+
+# Perplexity 는 토큰당이 아니라 쿼리당 과금. 모델별 per-call 추정치(USD).
+_PERPLEXITY_PER_CALL_USD = {
+    "sonar": 0.005,
+    "sonar-pro": 0.010,
+    "sonar-reasoning": 0.015,
+    "sonar-reasoning-pro": 0.020,
+}
+
+
+def _record_llm_cost_tokens(
+    api_name: str,
+    *,
+    tokens: int,
+    user_id: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Record a token-based LLM call (Gemini)."""
+    if tokens <= 0:
+        return
+    try:
+        _COST_TRACKER.record_api_call(
+            api_name=api_name,
+            cost_or_tokens=float(tokens),
+            user_id=user_id or None,
+            metadata=metadata or {},
+        )
+    except Exception as exc:
+        logger.debug("cost tracker token record failed: %s", exc)
+
+
+def _record_llm_cost_usd(
+    api_name: str,
+    *,
+    usd: float,
+    user_id: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Record a per-call USD cost (Perplexity). Values >= 1.0 are rejected to avoid
+    collision with the tracker's token-vs-USD heuristic."""
+    if usd <= 0 or usd >= 1.0:
+        return
+    try:
+        _COST_TRACKER.record_api_call(
+            api_name=api_name,
+            cost_or_tokens=float(usd),
+            user_id=user_id or None,
+            metadata=metadata or {},
+        )
+    except Exception as exc:
+        logger.debug("cost tracker usd record failed: %s", exc)
+
+
+def _gemini_api_name(model: str) -> str:
+    """Map Gemini model id to the cost tracker's API name key."""
+    if "pro" in model:
+        return "gemini_pro"
+    if "flash-lite" in model:
+        return "gemini_flash_lite"
+    return "gemini_flash"
+
+
+def _perplexity_api_name(model: str) -> str:
+    """Map Perplexity model id to the cost tracker's API name key."""
+    if "reasoning" in model or "pro" in model:
+        return "perplexity_research"
+    return "perplexity_standard"
+
+
+def _perplexity_per_call_usd(model: str) -> float:
+    return _PERPLEXITY_PER_CALL_USD.get(model, 0.005)
+
+
+def _extract_gemini_tokens(response) -> int:
+    """Pull total token count from a google-genai response if available."""
+    try:
+        usage = getattr(response, "usage_metadata", None)
+        if usage is None:
+            return 0
+        return int(getattr(usage, "total_token_count", 0) or 0)
+    except Exception:
+        return 0
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -35,18 +130,13 @@ logger = logging.getLogger(__name__)
 _env_file = os.getenv("TEAMSLACK_ENV_FILE", ".env.personal-bot").strip() or ".env.personal-bot"
 load_dotenv(REPO_ROOT / _env_file)
 load_dotenv(REPO_ROOT / ".env", override=False)
+# k-skill 공통 secrets (SRT/KTX/프록시 등). 사용자 홈 고정 경로이며 override 금지.
+load_dotenv(Path.home() / ".config" / "k-skill" / "secrets.env", override=False)
 
 PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions"
 
-# 기본 지침
-SYSTEM_PROMPT_BASE = (
-    "불필요한 수식어 금지: 인삿말, 과도한 리액션, 칭찬, 스몰토크 없이 본론만 답변한다.\n"
-    "말투: 기본 말투는 존댓말이 아닌 반말로 답한다.\n"
-    "맥락 격리: 질문의 주제와 상관없는 사용자의 개인적 취향(선호하는 음료, 습관, 기호 등)을 대화에 끌어들여 언급하지 않는다. 특히 비즈니스나 정보 검색 시 사적인 내용을 섞어 칭찬하지 않는다.\n"
-    "효율적 구조: 서론과 결론의 군더더기를 빼고, 사용자가 묻는 핵심 내용에 대해 즉시 답한다.\n"
-    "담백한 어조: 정확성과 효율성 중심의 전문적이고 드라이한 어조를 유지한다.\n"
-    "말투: 당당한 성격으로 단정적으로 답하고 문장 끝은 기본적으로 '~다!'로 마무리한다."
-)
+# 페르소나 음성 규칙은 shared/profile/personas/personal.md 에서 관리.
+SYSTEM_PROMPT_BASE = get_persona("personal").voice_rules
 
 # /psearch 지침
 SYSTEM_PROMPT_PSEARCH = SYSTEM_PROMPT_BASE + (
@@ -72,12 +162,48 @@ SYSTEM_PROMPT_PSEARCH_FORMATTED_FINANCE = SYSTEM_PROMPT_PSEARCH_FORMATTED + (
     "\n금융/주식/환율/코인/금리 답변은 숫자, 시점, 근거를 먼저 제시하고 추측성 표현을 배제한다."
 )
 
-# /usdtw 지침
+# /usdtw 지침 (변환 모드 전용: "/usdtw 10달러" 등 한 줄 환산 출력)
 SYSTEM_PROMPT_USDTW = (
     "미화-원화 환율 함수: USD→KRW 환율을 제공한다.\n"
     "첫 문장 필수 형식: '지금 기준으로 1달러는 약 00원이다! :hamster:'\n"
     "판단 포함: 최근 6개월 환율 흐름을 고려하여 현재가 저점/고점인지 한 줄 의견 제시. 문장은 '~다!'로 끝낸다.\n"
     "출처 생략: 참고 문헌이나 출처표시 [1][2] 등은 제공하지 않는다."
+)
+
+# 환율 질문(`/usdtw` 기본 모드 + 쥐피티 DM 내 환율 의도) 공용 응답 형식.
+# 형식 고정 근거: docs/guides/psearch-guideline-management.md §6 "환율 질문 답변 형식".
+SYSTEM_PROMPT_EXCHANGE_RATE = SYSTEM_PROMPT_BASE + (
+    "\n\n환율 질문 응답 규칙:\n"
+    "- Perplexity Finance 데이터베이스의 최신 시장 데이터만 기반으로 답한다.\n"
+    "- 정확히 2줄로만 출력한다. 서론·추가 설명·출처 표기([1], [2] 등)는 금지.\n"
+    "- 1번째 줄: '지금 기준으로 1달러는 약 NNN원이다! :hamster:' 형식(NNN 자리는 실제 수치).\n"
+    "- 2번째 줄: 최근 6개월 환율 흐름 기준 현재가 고점/저점/중간 중 어디인지 한 줄 평가. 문장은 '~다!'로 끝낸다."
+)
+
+# Gemini system instructions.
+# DM 자유 대화: 쥐피티가 사용자에게 직접 답변 → 페르소나 그대로 주입.
+SYSTEM_PROMPT_DM_CHAT = SYSTEM_PROMPT_BASE + (
+    "\n\n최근 대화 맥락이 주어지면 우선 반영하여 연속된 대화처럼 답한다."
+)
+
+# /summary: 쥐피티가 사용자에게 요약 결과를 전달 → 페르소나 유지 + 출력 형식 고정.
+SYSTEM_PROMPT_SUMMARY = SYSTEM_PROMPT_BASE + (
+    "\n\n요약 출력 형식: 1) 한 줄 핵심, 2) 주요 포인트(불릿 3개 이내), 3) 액션 아이템(있으면)."
+)
+
+# /reply 초안: 외부 수신자에게 전달될 답변이므로 쥐피티 페르소나(반말·~햄)를 사용하지 않는다.
+SYSTEM_PROMPT_REPLY_DRAFT = (
+    "원본 메시지에 대한 답변 초안을 생성한다. "
+    "직장인 업무 커뮤니케이션 말투로 존댓말을 유지하고, 불필요한 감탄/이모지/과장 표현을 쓰지 않는다. "
+    "답변은 간결하고 명확하며 실행 가능해야 한다. 기본은 최대 3문장으로 작성한다. "
+    "마크다운으로 가독성을 높이되 머리말/메타 문구 없이 답변 본문만 출력한다."
+)
+
+# /reply 수정: 초안을 사용자 지시대로 다시 쓸 때. 역시 페르소나 없이 업무 톤 유지.
+SYSTEM_PROMPT_REPLY_REWRITE = (
+    "원문 메시지에 대한 답변을 사용자의 수정 지시대로 새로 작성한다. "
+    "직장인 업무 말투(존댓말, 간결, 실행 중심)를 유지하고, 사용자 지시에 따라 문장 수를 조절한다. "
+    "출력 규칙: 최종 답변 본문만 출력한다. '네, 알겠습니다', '수정된 답변:' 같은 메타 문구·머리말·설명은 절대 출력하지 않는다."
 )
 
 
@@ -122,8 +248,33 @@ PENDING_DIRECT_SENDS: Dict[str, Dict[str, str]] = {}
 PENDING_TASK_WORKFLOWS: Dict[str, Dict[str, str]] = {}
 CHANNEL_RESOLUTION_CACHE: Dict[str, str] = {}
 USER_RESOLUTION_CACHE: Dict[str, str] = {}
+# user_id → Slack display_name (or real_name fallback). 운세 Slack 매칭용 얕은 캐시.
+SLACK_DISPLAY_NAME_CACHE: Dict[str, str] = {}
 DM_CHAT_ENABLED = os.getenv("PERSONAL_DM_CHAT_ENABLED", "1").strip() == "1"
 DM_CONTEXT_LIMIT = max(8, int(os.getenv("PERSONAL_DM_CONTEXT_LIMIT", "16").strip() or "16"))
+# 사주 프로필 신규 등록 시 승인 권한을 가진 소유자(default 사용자) 의 Slack user_id.
+# 비어 있으면 승인 플로우 없이 기존 자동 저장 경로로 동작.
+PERSONAL_BOT_OWNER_USER_ID = os.getenv("PERSONAL_BOT_OWNER_USER_ID", "").strip()
+
+
+def _owner_mention() -> str:
+    """소유자 멘션 문자열. env 비어 있으면 '소유자(default 사용자)' fallback."""
+    return (
+        f"<@{PERSONAL_BOT_OWNER_USER_ID}>"
+        if PERSONAL_BOT_OWNER_USER_ID
+        else "소유자(default 사용자)"
+    )
+
+
+def _owner_only_refusal(topic: str) -> str:
+    """비소유자가 내부 저장 값을 수정하려 할 때 표시하는 공통 안내.
+
+    사주뿐 아니라 향후 추가될 내부 저장 상태 전반에 동일한 톤으로 적용한다.
+    """
+    return (
+        f"{topic} 은(는) Slack 에서 수정 불가능하다! "
+        f"필요하면 {_owner_mention()} 에게 문의해달라."
+    )
 
 # ============ N-Step Workflow Definition ============
 # Workflow templates define sequential steps for complex multi-part tasks.
@@ -707,12 +858,12 @@ def _fetch_reply_source_message(
     return False, "원문 메시지를 찾지 못했습니다. 스레드에서 다시 시도하거나 메시지 링크를 입력해주세요.", None
 
 
-def _build_reply_draft_common(original_message: str) -> Tuple[bool, str, Optional[str]]:
+def _build_reply_draft_common(original_message: str, user_id: Optional[str] = None) -> Tuple[bool, str, Optional[str]]:
     """Generate reply draft from source text with unified behavior."""
     if not (original_message or "").strip():
         return False, "원문 메시지가 비어 있어 답변 초안을 생성할 수 없습니다.", None
 
-    reply_draft = _gemini_generate_reply(original_message, "대기", "")
+    reply_draft = _gemini_generate_reply(original_message, "대기", "", user_id=user_id)
     if not reply_draft:
         return False, "자동 답변 초안 생성을 할 수 없습니다. 잠시 후 다시 시도해주세요.", None
 
@@ -731,7 +882,7 @@ def _limit_sentences(text: str, max_sentences: int = 3) -> str:
     return " ".join(parts[:max_sentences]).strip()
 
 
-def _gemini_generate_reply(message_text: str, choice: str, context: str = "") -> Optional[str]:
+def _gemini_generate_reply(message_text: str, choice: str, context: str = "", user_id: Optional[str] = None) -> Optional[str]:
     """Generate reply draft using Gemini API.
     
     Args:
@@ -760,34 +911,30 @@ def _gemini_generate_reply(message_text: str, choice: str, context: str = "") ->
             "대기": "중립적이고 추가 정보를 요청하는",
         }
         choice_description = choice_map.get(choice, "일반적인")
-        
-        system_prompt = (
-            "원본 메시지에 대한 답변 초안을 생성해달라. "
-            "사용자의 선택 옵션을 고려하여 적절한 톤과 내용으로 작성한다. "
-            "답변은 간결하고 명확하며 실행 가능해야 한다. "
-            "기본 답변은 최대 3문장으로 작성한다. "
-            "직장인 업무 커뮤니케이션 말투를 사용한다. "
-            "존댓말을 유지하고 불필요한 감탄/이모지/과장 표현을 사용하지 않는다. "
-            "마크다운 형식을 사용하여 가독성을 높인다."
-        )
-        
-        prompt = (
-            f"지침: {system_prompt}\n\n"
-            f"원본 메시지: {normalized_message}\n\n"
-            f"응답 톤: {choice_description} 답변\n"
-        )
+
+        prompt_parts = [
+            f"원본 메시지: {normalized_message}",
+            f"응답 톤: {choice_description} 답변",
+        ]
         if context:
-            prompt += f"추가 맥락: {context}\n"
-        
-        prompt += "\n위 메시지에 대한 답변 초안을 생성해주세요."
-        
+            prompt_parts.append(f"추가 맥락: {context}")
+        prompt = "\n\n".join(prompt_parts)
+
+        model = select_gemini_model(task_type="reply_draft", doc_length=len(normalized_message))
         response = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
+            model=model,
             contents=prompt,
             config=genai.types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT_REPLY_DRAFT,
                 max_output_tokens=260,
                 temperature=0.4,
             ),
+        )
+        _record_llm_cost_tokens(
+            _gemini_api_name(model),
+            tokens=_extract_gemini_tokens(response),
+            user_id=user_id,
+            metadata={"model": model, "feature": "reply_draft", "choice": choice},
         )
 
         if response and response.text:
@@ -795,11 +942,11 @@ def _gemini_generate_reply(message_text: str, choice: str, context: str = "") ->
             return _limit_sentences(text, max_sentences=3)
     except Exception as e:
         logger.warning(f"Gemini API failed: {e}")
-    
+
     return None
 
 
-def _gemini_generate_summary(text: str) -> Optional[str]:
+def _gemini_generate_summary(text: str, user_id: Optional[str] = None) -> Optional[str]:
     """Generate concise summary text from raw user input."""
     if not GEMINI_AVAILABLE:
         return None
@@ -811,23 +958,23 @@ def _gemini_generate_summary(text: str) -> Optional[str]:
     try:
         api_key = _required_env("GEMINI_API_KEY")
         client = genai.Client(api_key=api_key)
-        prompt = (
-            "다음 내용을 업무용 요약으로 정리한다. "
-            "핵심만 남기고 군더더기는 제거한다. "
-            "출력 형식은 다음 순서로 고정한다: \n"
-            "1) 한 줄 핵심\n"
-            "2) 주요 포인트(불릿 3개 이내)\n"
-            "3) 액션 아이템(있으면)\n\n"
-            f"원문:\n{normalized_text}"
-        )
+        prompt = f"원문:\n{normalized_text}"
 
+        model = select_gemini_model(task_type="long_summary", doc_length=len(normalized_text))
         response = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
+            model=model,
             contents=prompt,
             config=genai.types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT_SUMMARY,
                 max_output_tokens=360,
                 temperature=0.3,
             ),
+        )
+        _record_llm_cost_tokens(
+            _gemini_api_name(model),
+            tokens=_extract_gemini_tokens(response),
+            user_id=user_id,
+            metadata={"model": model, "feature": "summary", "doc_length": len(normalized_text)},
         )
         if response and response.text:
             return response.text.strip()
@@ -888,7 +1035,622 @@ def _is_finance_query(user_text: str) -> bool:
     return any(keyword in text for keyword in finance_keywords)
 
 
+def _is_exchange_rate_query(user_text: str) -> bool:
+    """환율(USD/KRW) 의도 판정. finance 질문 중 이 하위집합만 2줄 고정 포맷 적용."""
+    text = (user_text or "").strip().lower()
+    if not text:
+        return False
+
+    keywords = ["환율", "원달러", "달러", "usd", "krw"]
+    return any(keyword in text for keyword in keywords)
+
+
+# =============== Weather + fine-dust (k-skill-proxy) ===============
+# Scope: 쥐피티 DM 자유 대화에서 "날씨/기온/미세먼지" 등 키워드가 잡히면
+# Perplexity/Gemini 경로로 넘기기 전에 k-skill-proxy 를 먼저 찔러본다.
+# 해외 지역(비한국)은 Perplexity 3줄 포맷으로 fallback.
+# SKILL 참고: ~/.agents/skills/korea-weather/SKILL.md, fine-dust-location/SKILL.md
+
+_WEATHER_KEYWORDS: tuple[str, ...] = (
+    "날씨", "기온", "온도",
+    "비와", "비 와", "비 옴", "비옴", "눈와", "눈 와", "소나기",
+    "춥", "추워", "추운", "추위",
+    "덥", "더워", "더운", "더위",
+    "맑", "흐림", "흐려", "폭염", "한파", "미세먼지", "황사",
+)
+
+_YONGSAN_DEFAULT: Dict[str, Any] = {
+    "place": "서울 용산구",
+    "lat": 37.5326,
+    "lon": 126.9905,
+    "region_hint": "용산구",
+}
+
+_GEOCODE_SCHEMA: Dict[str, Any] = {
+    "type": "OBJECT",
+    "properties": {
+        "status": {
+            "type": "STRING",
+            "enum": ["ok", "non_korea", "missing", "ambiguous"],
+        },
+        "place": {"type": "STRING"},
+        "lat": {"type": "NUMBER"},
+        "lon": {"type": "NUMBER"},
+        "region_hint": {"type": "STRING"},
+        "reason": {"type": "STRING"},
+    },
+    "required": ["status"],
+}
+
+_GEOCODE_SYSTEM = (
+    "사용자의 날씨 질문에서 지명을 추출해 WGS84 lat/lon 과 에어코리아 측정소 힌트를 반환한다. "
+    "status 4가지 중 하나:\n"
+    "- 'ok': 한국 내 구체 지명 확정. place/lat/lon/region_hint 전부 채움.\n"
+    "- 'non_korea': 한국 외 지역. place 만.\n"
+    "- 'missing': 지명 전혀 없음.\n"
+    "- 'ambiguous': 지명 있으나 너무 광범위.\n"
+    "region_hint 규칙 (status=ok 일 때만):\n"
+    "  - 에어코리아 측정소명에 가장 가까운 한국 행정구역 표기.\n"
+    "  - 서울 안: 해당 '구' 이름 (예: '강남구', '용산구', '종로구').\n"
+    "  - 서울 외 광역시/도내 '구': 해당 '구' 이름.\n"
+    "  - 경기/강원 중소도시: 도시명 (예: '수원', '성남', '강릉'). 매칭 실패 가능성 있음.\n"
+    "  - 광역시도만 있으면: 광역명 (예: '부산', '제주').\n"
+    "  - 판교/여의도 등 특정 지구: 가장 가까운 구/시 (예: 판교→'성남', 여의도→'영등포구').\n"
+    "좌표 규칙: lat 33~39, lon 124~132. 소수점 4자리. 확신 낮으면 'ambiguous'."
+)
+
+_PERPLEXITY_WEATHER_SYSTEM = (
+    "한국 외 지역 날씨 질문에 답한다. "
+    "정확히 4줄로만 출력한다. 서론·출처([1],[2] 등)·추가 설명 금지. 볼드는 **로 감싼 마크다운을 사용한다.\n"
+    "1번째 줄: '**{지명}** 지금 **N°C**, {하늘상태}!' — '이다/다' 같은 서술어미 금지, 하늘상태 뒤는 바로 '!'.\n"
+    "2번째 줄: '• 습도 **N%** · 풍속 **N m/s** · 강수확률 **N%**'\n"
+    "3번째 줄: '• 대기질지수 AQI **N ({등급})**' — 최신 AQI 수치와 등급(좋음/보통/나쁨/매우나쁨).\n"
+    "4번째 줄: '`현지 기상 기관 {기관명} 최신 발표`' (백틱으로 감싼 inline code 형식)."
+)
+
+# 동일 문장 반복 질의 비용 절감용 in-process 캐시. 프로세스 생애 동안만 유효.
+_WEATHER_GEOCODE_CACHE: Dict[str, Dict[str, Any]] = {}
+_WEATHER_CACHE_MAX = 64
+
+
+def _is_weather_query(user_text: str) -> bool:
+    text = (user_text or "").lower()
+    if not text:
+        return False
+    return any(kw in text for kw in _WEATHER_KEYWORDS)
+
+
+def _kskill_proxy_base() -> str:
+    return os.getenv("KSKILL_PROXY_BASE_URL", "").strip().rstrip("/")
+
+
+def _geocode_korean_place(user_text: str) -> Dict[str, Any]:
+    """Gemini structured output 으로 한국 지명 → lat/lon/region_hint 추출."""
+    if not GEMINI_AVAILABLE:
+        return {"status": "ambiguous", "reason": "Gemini 미구성"}
+
+    cache_key = (user_text or "").strip()
+    cached = _WEATHER_GEOCODE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        api_key = _required_env("GEMINI_API_KEY")
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-lite",
+            contents=f"사용자 문장: {user_text}",
+            config=genai.types.GenerateContentConfig(
+                system_instruction=_GEOCODE_SYSTEM,
+                response_mime_type="application/json",
+                response_schema=_GEOCODE_SCHEMA,
+                temperature=0.0,
+                max_output_tokens=150,
+            ),
+        )
+        _record_llm_cost_tokens(
+            _gemini_api_name("gemini-2.5-flash-lite"),
+            tokens=_extract_gemini_tokens(response),
+            metadata={"feature": "weather_geocode"},
+        )
+        raw = (response.text or "").strip()
+    except Exception as exc:
+        logger.warning(f"Weather geocode failed: {exc}")
+        return {"status": "ambiguous", "reason": f"geocode exception: {exc}"}
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"status": "ambiguous", "reason": f"JSON parse fail: {raw[:80]}"}
+
+    status = data.get("status") or "ambiguous"
+    if status == "ok":
+        try:
+            lat = float(data["lat"])
+            lon = float(data["lon"])
+        except (KeyError, TypeError, ValueError):
+            return {"status": "ambiguous", "reason": "lat/lon 누락"}
+        if not (33.0 <= lat <= 39.5 and 124.0 <= lon <= 132.0):
+            return {"status": "ambiguous", "reason": f"좌표 범위 벗어남 ({lat},{lon})"}
+        result: Dict[str, Any] = {
+            "status": "ok",
+            "place": data.get("place") or "",
+            "lat": lat,
+            "lon": lon,
+            "region_hint": data.get("region_hint") or "",
+        }
+    else:
+        result = {
+            "status": status,
+            "place": data.get("place") or "",
+            "reason": data.get("reason") or "",
+        }
+
+    if len(_WEATHER_GEOCODE_CACHE) < _WEATHER_CACHE_MAX:
+        _WEATHER_GEOCODE_CACHE[cache_key] = result
+    return result
+
+
+def _fetch_korea_weather(lat: float, lon: float) -> Optional[Dict[str, Any]]:
+    """KMA 단기예보 조회. 1회 재시도 포함(프록시 타임아웃 완화)."""
+    base = _kskill_proxy_base()
+    if not base:
+        return None
+    qs = f"lat={lat:.4f}&lon={lon:.4f}"
+    url = f"{base}/v1/korea-weather/forecast?{qs}"
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "teamslack-personal-bot/0.1",
+    }
+    for attempt in (1, 2):
+        try:
+            response = requests.get(url, headers=headers, timeout=15)
+            response.raise_for_status()
+            return response.json()
+        except Exception as exc:
+            if attempt == 2:
+                logger.warning(f"Korea weather fetch failed (attempt {attempt}): {exc}")
+                return None
+            time.sleep(0.8)
+    return None
+
+
+def _fetch_fine_dust(region_hint: str) -> Optional[Dict[str, Any]]:
+    """에어코리아 측정소 조회. 실패/빈 hint 시 None (best-effort)."""
+    base = _kskill_proxy_base()
+    if not base or not region_hint:
+        return None
+    url = f"{base}/v1/fine-dust/report?regionHint={requests.utils.quote(region_hint)}"
+    try:
+        response = requests.get(
+            url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "teamslack-personal-bot/0.1",
+            },
+            timeout=12,
+        )
+        if response.status_code >= 400:
+            return None
+        return response.json()
+    except Exception:
+        return None
+
+
+def _ko_has_batchim(word: str) -> bool:
+    """한글 마지막 음절 받침 존재 여부. 비한글 문자면 False."""
+    if not word:
+        return False
+    last = word.strip()[-1]
+    code = ord(last)
+    if 0xAC00 <= code <= 0xD7A3:
+        return (code - 0xAC00) % 28 != 0
+    return False
+
+
+def _ko_eun_neun(word: str) -> str:
+    """주격/주제격 조사 '은'/'는' 선택."""
+    if not word:
+        return "는"
+    return "은" if _ko_has_batchim(word) else "는"
+
+
+def _dust_line(dust: Optional[Dict[str, Any]]) -> str:
+    """미세먼지 라인. 값이 하나도 없으면 빈 문자열."""
+    if not dust:
+        return ""
+    pm10 = dust.get("pm10") or {}
+    pm25 = dust.get("pm25") or {}
+    pm10_val = pm10.get("value") or "?"
+    pm25_val = pm25.get("value") or "?"
+    if pm10_val == "?" and pm25_val == "?":
+        return ""
+    pm10_grade = pm10.get("grade") or ""
+    pm25_grade = pm25.get("grade") or ""
+    khai = dust.get("khai_grade") or ""
+
+    pm10_inner = f"{pm10_val} ({pm10_grade})" if pm10_grade else pm10_val
+    pm25_inner = f"{pm25_val} ({pm25_grade})" if pm25_grade else pm25_val
+    parts = [f"PM10 **{pm10_inner}**", f"PM2.5 **{pm25_inner}**"]
+    if khai:
+        parts.append(f"통합 **{khai}**")
+    return "• 미세먼지 " + " / ".join(parts)
+
+
+_SKY_MAP = {"1": "맑음", "3": "구름많음", "4": "흐림"}
+_PTY_MAP = {"0": "", "1": "비", "2": "비/눈", "3": "눈", "4": "소나기"}
+
+
+def _summarize_korea_weather(
+    payload: Dict[str, Any],
+    *,
+    place: str,
+    dust: Optional[Dict[str, Any]],
+    target_date: Optional[str] = None,
+    offset_word: str = "지금",
+) -> str:
+    items = (payload.get("response") or {}).get("body", {}).get("items", {}).get("item") or []
+    if not items:
+        return f"**{place}** 예보 데이터가 비었다! 발표 시각이 아직 안 됐을 수 있다!"
+
+    base_date = items[0].get("baseDate", "")
+    base_time = items[0].get("baseTime", "")
+
+    # 오늘(target_date=None): 가장 이른 fcstTime 슬롯의 시간별 값 표시.
+    # 미래 날짜(target_date="YYYYMMDD"): 해당 날짜만 필터해서 정오(1200) 근접 슬롯 +
+    # TMN/TMX (최저/최고) 를 뽑아 하루 요약 포맷으로 표시.
+    if target_date:
+        filtered = [it for it in items if it.get("fcstDate") == target_date]
+        if not filtered:
+            return f"**{place}** {offset_word} 예보 데이터가 비었다!"
+        times = sorted({it.get("fcstTime") for it in filtered if it.get("fcstTime")})
+        if not times:
+            return f"**{place}** {offset_word} 예보 데이터가 비었다!"
+        target_time = min(times, key=lambda t: abs(int(t) - 1200))
+        slot = [it for it in filtered if it.get("fcstTime") == target_time]
+        fields: Dict[str, str] = {}
+        for it in slot:
+            fields[it.get("category", "")] = str(it.get("fcstValue", ""))
+        tmn = next(
+            (str(it.get("fcstValue")) for it in filtered if it.get("category") == "TMN"),
+            None,
+        )
+        tmx = next(
+            (str(it.get("fcstValue")) for it in filtered if it.get("category") == "TMX"),
+            None,
+        )
+        sky = _SKY_MAP.get(fields.get("SKY", ""), fields.get("SKY", ""))
+        pty = _PTY_MAP.get(fields.get("PTY", ""), "")
+        sky_text = pty if pty else sky
+
+        if tmn and tmx:
+            header = f"**{place}** {offset_word} 최저 **{tmn}°C** / 최고 **{tmx}°C**, {sky_text}!"
+        else:
+            tmp = fields.get("TMP", "?")
+            header = f"**{place}** {offset_word} **{tmp}°C**, {sky_text}!"
+        pop = fields.get("POP", "?")
+        reh = fields.get("REH", "?")
+        wsd = fields.get("WSD", "?")
+        metrics = f"• 습도 **{reh}%** · 풍속 **{wsd}m/s** · 강수확률 **{pop}%**"
+        lines = [header, metrics]
+        lines.append("`" + f"KMA 단기예보 {base_date} {base_time}".strip() + "`")
+        return "\n".join(lines)
+
+    first_slot_time = items[0].get("fcstTime")
+    first_slot = [it for it in items if it.get("fcstTime") == first_slot_time]
+
+    fields = {}
+    for it in first_slot:
+        fields[it.get("category", "")] = str(it.get("fcstValue", ""))
+
+    sky = _SKY_MAP.get(fields.get("SKY", ""), fields.get("SKY", ""))
+    pty = _PTY_MAP.get(fields.get("PTY", ""), "")
+    sky_text = pty if pty else sky
+
+    tmp = fields.get("TMP", "?")
+    pop = fields.get("POP", "?")
+    reh = fields.get("REH", "?")
+    wsd = fields.get("WSD", "?")
+
+    header = f"**{place}** 지금 **{tmp}°C**, {sky_text}!"
+    metrics = f"• 습도 **{reh}%** · 풍속 **{wsd}m/s** · 강수확률 **{pop}%**"
+    lines = [header, metrics]
+
+    dust_text = _dust_line(dust)
+    if dust_text:
+        lines.append(dust_text)
+
+    source_parts = [f"KMA 단기예보 {base_date} {base_time}".strip()]
+    if dust:
+        station = (dust.get("station_name") or "").strip()
+        if station and dust_text:
+            source_parts.append(f"에어코리아 {station}")
+    lines.append("`" + " · ".join(source_parts) + "`")
+    return "\n".join(lines)
+
+
+def _weather_perplexity_non_korea(user_text: str) -> str:
+    """한국 외 지역은 Perplexity 3줄 포맷으로 회신 (AQI 포함)."""
+    try:
+        return _perplexity_search(
+            user_text,
+            system_prompt=_PERPLEXITY_WEATHER_SYSTEM,
+            remove_citations=True,
+            apply_gom_style=False,
+            format_for_slack_output=False,
+        )
+    except Exception as exc:
+        logger.warning(f"Weather Perplexity fallback failed: {exc}")
+        return "해외 날씨 조회 실패! 잠시 후 다시 시도해달라!"
+
+
+# 날짜 오프셋: KMA 단기예보는 당일부터 4일 뒤까지 제공. 사용자 합의로
+# 지원 범위는 오늘/내일/모레 (0/1/2) 로 제한, 그 이후는 스타일 맞춰 거절.
+_WEATHER_DATE_KEYWORDS: Dict[str, int] = {
+    "그저께": -2, "그제": -2,
+    "어제": -1,
+    "오늘": 0,
+    "내일": 1,
+    "모레": 2,
+    "글피": 3,
+    "그글피": 4,
+}
+
+
+def _parse_weather_date_offset(text: str) -> int:
+    t = text or ""
+    # 긴 키워드 우선 매칭: '그글피' 가 '글피' 보다 먼저 검사돼야 올바른 오프셋.
+    for kw in sorted(_WEATHER_DATE_KEYWORDS, key=len, reverse=True):
+        if kw in t:
+            return _WEATHER_DATE_KEYWORDS[kw]
+    m = re.search(r'(\d+)\s*일\s*(?:후|뒤)', t)
+    if m:
+        return int(m.group(1))
+    m = re.search(r'(\d+)\s*일\s*(?:전|앞)', t)
+    if m:
+        return -int(m.group(1))
+    return 0
+
+
+_OFFSET_WORD_MAP = {-2: "그제", -1: "어제", 0: "지금", 1: "내일", 2: "모레"}
+
+
+def _offset_word(offset: int) -> str:
+    if offset in _OFFSET_WORD_MAP:
+        return _OFFSET_WORD_MAP[offset]
+    if offset < 0:
+        return f"{abs(offset)}일 전"
+    return f"{offset}일 뒤"
+
+
+def _past_weather_system(target: date, offset_word: str) -> str:
+    """과거 날씨 Perplexity 시스템 프롬프트. 출처를 현 기능과 동일 계열로 지정."""
+    iso = target.isoformat()
+    return (
+        f"대상 날짜: {iso} ({offset_word}). 한국 지역 과거 관측 기상·대기질 답변.\n"
+        "출처는 기상청 ASOS/AWS 관측자료, 에어코리아 과거자료를 우선 참조. "
+        "부족 시 네이버/Google 날씨 기록 보완.\n"
+        "정확히 4줄. 서론·출처번호([1] 등)·추가 설명 금지. 볼드는 ** 마크다운.\n"
+        "1번째: '**<지명>** " + offset_word + " 최저 **N°C** / 최고 **N°C**, <하늘상태>!'\n"
+        "2번째: '• 강수량 **Nmm** · 평균습도 **N%** · 평균풍속 **N m/s**'\n"
+        "3번째: '• 미세먼지 PM10 **N (등급)** / PM2.5 **N (등급)** / 통합 **등급**'\n"
+        "4번째: '`기상청 ASOS 관측자료 · 에어코리아 과거자료 " + iso + "`' (백틱 inline code)."
+    )
+
+
+def _weather_past_perplexity(user_text: str, *, offset: int) -> str:
+    target = date.today() + timedelta(days=offset)
+    off_word = _offset_word(offset)
+    system = _past_weather_system(target, off_word)
+    query = f"{user_text} (대상 날짜: {target.isoformat()})"
+    try:
+        return _perplexity_search(
+            query,
+            system_prompt=system,
+            remove_citations=True,
+            apply_gom_style=False,
+            format_for_slack_output=False,
+        )
+    except Exception as exc:
+        logger.warning("Weather past Perplexity failed: %s", exc)
+        return "과거 날씨 조회 실패! 잠시 후 다시 시도해달라!"
+
+
+def _unsupported_future_weather_reply(place: str, offset: int) -> str:
+    off_word = _offset_word(offset)
+    place_disp = place or _YONGSAN_DEFAULT["place"]
+    return (
+        f"**{place_disp}** {off_word} 예보는 지원하지 않아!\n"
+        f"• 기상청 단기예보는 오늘/내일/모레만 제공해!\n"
+        f"`k-skill-proxy /v1/korea-weather/forecast 지원 범위 초과`"
+    )
+
+
+def _build_weather_reply(user_text: str) -> Optional[str]:
+    """날씨 intent 분기 실행. 처리 가능한 경우 최종 텍스트, 그 외 None."""
+    if not _kskill_proxy_base():
+        logger.info("KSKILL_PROXY_BASE_URL not set — weather flow skipped")
+        return None
+
+    offset = _parse_weather_date_offset(user_text)
+
+    # 과거 → Perplexity fallback (같은 출처 계열 지시 + 오늘 포맷과 동일한 4줄)
+    if offset < 0:
+        return _weather_past_perplexity(user_text, offset=offset)
+
+    geo = _geocode_korean_place(user_text)
+    status = geo.get("status")
+
+    # 3일 이후 미래 → 스타일 맞춘 거절
+    if offset >= 3:
+        place = ""
+        if status in ("ok", "ambiguous"):
+            place = geo.get("place") or ""
+        return _unsupported_future_weather_reply(place, offset)
+
+    # offset ∈ {0, 1, 2}
+    today = date.today()
+    target_date_str: Optional[str] = None
+    off_word = "지금"
+    if offset > 0:
+        target_date_str = (today + timedelta(days=offset)).strftime("%Y%m%d")
+        off_word = _offset_word(offset)
+
+    if status == "ok":
+        payload = _fetch_korea_weather(geo["lat"], geo["lon"])
+        if not payload:
+            return f"**{geo.get('place') or '해당 지역'}** 날씨 데이터를 못 가져왔다! 잠시 후 다시 시도해달라!"
+        # 실시간 미세먼지는 오늘에만 의미가 있다
+        dust = _fetch_fine_dust(geo.get("region_hint") or "") if offset == 0 else None
+        return _summarize_korea_weather(
+            payload,
+            place=geo.get("place") or "",
+            dust=dust,
+            target_date=target_date_str,
+            offset_word=off_word,
+        )
+
+    if status == "non_korea":
+        # 한국 외 지역은 오늘/미래 모두 Perplexity 경로. 미래 날짜여도 동일 프롬프트에
+        # 날짜 힌트를 얹어 답변하도록 질의에 대상 날짜를 명시.
+        if offset == 0:
+            return _weather_perplexity_non_korea(user_text)
+        target = today + timedelta(days=offset)
+        return _weather_perplexity_non_korea(
+            f"{user_text} (대상 날짜: {target.isoformat()}, {off_word})"
+        )
+
+    if status == "missing":
+        payload = _fetch_korea_weather(_YONGSAN_DEFAULT["lat"], _YONGSAN_DEFAULT["lon"])
+        if not payload:
+            return "기본 위치(**서울 용산구**) 날씨 조회 실패! 지명을 직접 알려달라!"
+        dust = _fetch_fine_dust(_YONGSAN_DEFAULT["region_hint"]) if offset == 0 else None
+        return _summarize_korea_weather(
+            payload,
+            place=_YONGSAN_DEFAULT["place"],
+            dust=dust,
+            target_date=target_date_str,
+            offset_word=off_word,
+        )
+
+    if status == "ambiguous":
+        hint = geo.get("place") or "입력된 위치"
+        josa = _ko_eun_neun(hint)
+        return f"'**{hint}**'{josa} 너무 광범위하다! 구체적인 시/구/동이나 랜드마크로 다시 알려달라!"
+
+    return "지명을 판정하지 못했다! 어느 지역 날씨인지 다시 알려달라!"
+
+
+def _run_skill_with_status(
+    channel_id: str,
+    client,
+    status_text: str,
+    build_reply,
+    user_id: str = "",
+) -> Optional[str]:
+    """Post a transient status message, run build_reply(), update with final text.
+
+    Returns the final text (pre-prefix) if a reply was produced, else None.
+    Used by both DM and app_mention handlers.
+    """
+    prefix = f"<@{user_id}> " if user_id else ""
+    status_ts = ""
+    try:
+        status_msg = client.chat_postMessage(
+            channel=channel_id,
+            text=f"{prefix}{status_text}",
+        )
+        status_ts = (status_msg.get("ts") or "").strip()
+    except Exception:
+        status_ts = ""
+
+    reply = build_reply()
+    if not reply:
+        if status_ts:
+            try:
+                client.chat_delete(channel=channel_id, ts=status_ts)
+            except Exception:
+                pass
+        return None
+
+    final = to_slack_format(reply)
+    display = f"{prefix}{final}"
+    if status_ts:
+        try:
+            client.chat_update(channel=channel_id, ts=status_ts, text=display)
+            return final
+        except Exception:
+            pass
+    try:
+        client.chat_postMessage(channel=channel_id, text=display)
+    except Exception:
+        pass
+    return final
+
+
+def _dispatch_skill_intent(
+    text: str,
+    channel_id: str,
+    client,
+    user_id: str = "",
+) -> bool:
+    """Run k-skill intent gates (subway/stock/realestate/SRT/KTX/hanriver/weather).
+
+    Returns True if an intent matched AND a reply was posted (caller should return).
+    Fortune is DM-only (interactive registration) and is NOT handled here.
+    """
+    if subway_engine.is_subway_query(text):
+        _run_skill_with_status(
+            channel_id, client, "지하철 도착 정보 조회 중입니다...",
+            lambda: subway_engine.build_subway_reply(text), user_id=user_id,
+        )
+        return True
+    if stock_engine.is_korean_stock_query(text):
+        _run_skill_with_status(
+            channel_id, client, "국내 주식 시세 조회 중입니다...",
+            lambda: stock_engine.build_korean_stock_reply(text), user_id=user_id,
+        )
+        return True
+    if realestate_engine.is_real_estate_query(text):
+        _run_skill_with_status(
+            channel_id, client, "부동산 실거래 조회 중입니다...",
+            lambda: realestate_engine.build_real_estate_reply(text), user_id=user_id,
+        )
+        return True
+    if srt_engine.is_srt_query(text):
+        _run_skill_with_status(
+            channel_id, client, "SRT 열차 조회 중입니다...",
+            lambda: srt_engine.build_srt_reply(text), user_id=user_id,
+        )
+        return True
+    if ktx_engine.is_ktx_query(text):
+        _run_skill_with_status(
+            channel_id, client, "KTX 열차 조회 중입니다...",
+            lambda: ktx_engine.build_ktx_reply(text), user_id=user_id,
+        )
+        return True
+    if hanriver_engine.is_han_river_query(text):
+        _run_skill_with_status(
+            channel_id, client, "한강 수위 조회 중입니다...",
+            lambda: hanriver_engine.build_han_river_reply(text), user_id=user_id,
+        )
+        return True
+    if _is_weather_query(text):
+        result = _run_skill_with_status(
+            channel_id, client, "날씨 확인 중입니다...",
+            lambda: _build_weather_reply(text), user_id=user_id,
+        )
+        # weather intent 감지됐지만 proxy 미설정/미지원 등 None 반환 시
+        # caller 가 일반 검색/대화 경로로 fall through 하도록 False 반환.
+        if result is not None:
+            return True
+    return False
+
+
 def _perplexity_system_prompt_for_query(user_text: str, *, formatted: bool = False) -> str:
+    # 환율 질문은 formatted 여부와 무관하게 2줄 고정 포맷이 우선한다.
+    if _is_exchange_rate_query(user_text):
+        return SYSTEM_PROMPT_EXCHANGE_RATE
     if _is_finance_query(user_text):
         return SYSTEM_PROMPT_PSEARCH_FORMATTED_FINANCE if formatted else SYSTEM_PROMPT_PSEARCH_FINANCE
     return SYSTEM_PROMPT_PSEARCH_FORMATTED if formatted else SYSTEM_PROMPT_PSEARCH
@@ -1023,6 +1785,31 @@ def _build_recent_channel_context(client, channel_id: str, latest_ts: str, reque
 
 def _pending_direct_send_key(user_id: str) -> str:
     return user_id.strip()
+
+
+def _fetch_slack_display_name(client, user_id: str) -> str:
+    """Return the Slack user's display_name (fallback: real_name, name). Cached."""
+    if not user_id:
+        return ""
+    cached = SLACK_DISPLAY_NAME_CACHE.get(user_id)
+    if cached is not None:
+        return cached
+    try:
+        resp = client.users_info(user=user_id)
+        user = resp.get("user") or {}
+        profile = user.get("profile") or {}
+        name = (
+            profile.get("display_name")
+            or profile.get("real_name")
+            or user.get("real_name")
+            or user.get("name")
+            or ""
+        ).strip()
+    except Exception as exc:
+        logger.warning("users_info lookup failed for %s: %s", user_id, exc)
+        name = ""
+    SLACK_DISPLAY_NAME_CACHE[user_id] = name
+    return name
 
 
 def _normalize_channel_reference(channel_ref: str) -> str:
@@ -1575,6 +2362,68 @@ def _build_workflow_approval_blocks(
     ]
 
 
+def _format_fortune_profile_preview(profile: Dict[str, Any]) -> str:
+    return (
+        f"• 생년월일: {profile.get('birth_date') or '미등록'}\n"
+        f"• 띠: {profile.get('zodiac_ko') or '미등록'}\n"
+        f"• 별자리: {profile.get('zodiac_western') or '미등록'}\n"
+        f"• 일간: {profile.get('ilgan') or '미등록'}"
+    )
+
+
+def _build_fortune_approval_blocks(
+    *,
+    approval_id: str,
+    requester_ref: str,
+    target_name: str,
+    mode: str,
+    profile: Dict[str, Any],
+) -> list[dict[str, Any]]:
+    mode_label = "수정" if mode == "update" else "신규 등록"
+    preview = _format_fortune_profile_preview(profile)
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"*사주 프로필 {mode_label} 승인 요청*\n"
+                    f"요청자: {requester_ref}\n"
+                    f"대상: *{target_name}*\n\n{preview}"
+                ),
+            },
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "승인"},
+                    "action_id": "fortune_profile_approve",
+                    "value": approval_id,
+                    "style": "primary",
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "거부"},
+                    "action_id": "fortune_profile_reject",
+                    "value": approval_id,
+                    "style": "danger",
+                },
+            ],
+        },
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": f"승인 ID: `{approval_id}` · 1주일 내 미처리 시 자동 만료",
+                }
+            ],
+        },
+    ]
+
+
 def _send_direct_message_to_channel(
     client,
     *,
@@ -1865,7 +2714,7 @@ def _start_search_then_send_workflow(
     status_ts = (status.get("ts") or "").strip()
 
     try:
-        search_result_raw = _perplexity_chat_dm(query, recent_context=recent_context)
+        search_result_raw = _perplexity_chat_dm(query, recent_context=recent_context, user_id=user_id)
     except Exception as exc:
         logger.exception("search_then_send workflow: search failed")
         fail_text = f"검색 실패: {exc}"
@@ -2229,7 +3078,7 @@ def _handle_direct_send_request(
     return True
 
 
-def _gemini_chat_dm(user_text: str, recent_context: str = "") -> Optional[str]:
+def _gemini_chat_dm(user_text: str, recent_context: str = "", user_id: Optional[str] = None) -> Optional[str]:
     """Generate direct-message chat response for personal bot."""
     if not GEMINI_AVAILABLE:
         return None
@@ -2242,24 +3091,25 @@ def _gemini_chat_dm(user_text: str, recent_context: str = "") -> Optional[str]:
         api_key = _required_env("GEMINI_API_KEY")
         client = genai.Client(api_key=api_key)
         prompt = (
-            "너는 Slack 개인 비서 봇이다. "
-            "한국어로 간결하고 실무적으로 답한다. "
-            "불필요한 인삿말과 장황한 서론은 생략한다. "
-            "필요할 때만 불릿을 사용한다.\n"
-            "기본 말투는 당당한 어조로 문장 끝을 '~다!'로 맞춘다.\n"
-            "기본 이모지 스타일은 문단 흐름에 맞춰 :hamster: 를 사용한다.\n"
-            "최근 대화 맥락이 주어지면 우선 반영하여 연속된 대화처럼 답한다.\n\n"
             f"최근 대화:\n{recent_context or '(없음)'}\n\n"
             f"사용자 최신 메시지:\n{prompt_text}"
         )
 
+        model = select_gemini_model(task_type="chat", doc_length=len(prompt_text) + len(recent_context or ""))
         response = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
+            model=model,
             contents=prompt,
             config=genai.types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT_DM_CHAT,
                 max_output_tokens=420,
                 temperature=0.4,
             ),
+        )
+        _record_llm_cost_tokens(
+            _gemini_api_name(model),
+            tokens=_extract_gemini_tokens(response),
+            user_id=user_id,
+            metadata={"model": model, "feature": "dm_chat"},
         )
         if response and response.text:
             return add_gom_emojis(response.text.strip())
@@ -2269,8 +3119,13 @@ def _gemini_chat_dm(user_text: str, recent_context: str = "") -> Optional[str]:
     return None
 
 
-def _perplexity_chat_dm(user_text: str, recent_context: str = "") -> str:
-    """Generate DM response using Perplexity for search/research intent."""
+def _perplexity_chat_dm(user_text: str, recent_context: str = "", user_id: Optional[str] = None) -> str:
+    """Generate DM response using Perplexity for search/research intent.
+
+    Model selection is delegated to select_perplexity_model() so DM search stays
+    consistent with /psearch routing (keyword-based). Finance queries still route
+    through the Finance-flavored system prompt via _perplexity_system_prompt_for_query.
+    """
     search_query = _extract_search_query(user_text)
     year_terms = _extract_year_terms(search_query)
     year_rule = ""
@@ -2295,13 +3150,13 @@ def _perplexity_chat_dm(user_text: str, recent_context: str = "") -> str:
         query,
         system_prompt=_perplexity_system_prompt_for_query(user_text, formatted=True),
         remove_citations=True,
-        model_override="sonar-pro",
         apply_gom_style=False,
         format_for_slack_output=False,
+        user_id=user_id,
     )
 
 
-def _rewrite_reply_draft(original_message: str, instruction: str) -> Optional[str]:
+def _rewrite_reply_draft(original_message: str, instruction: str, user_id: Optional[str] = None) -> Optional[str]:
     """Regenerate draft from original message by user instruction.
 
     This does not append changes to the previous draft; each rewrite is freshly generated
@@ -2314,22 +3169,25 @@ def _rewrite_reply_draft(original_message: str, instruction: str) -> Optional[st
         api_key = _required_env("GEMINI_API_KEY")
         client = genai.Client(api_key=api_key)
         prompt = (
-            "아래 원문 메시지에 대한 답변을 사용자의 수정 지시대로 새로 작성해달라. "
-            "직장인 업무 말투(존댓말, 간결, 실행 중심)로 유지한다. "
-            "사용자 지시에 따라 문장 수를 조절한다. 별도 문장 수 제한은 없다.\n\n"
-            "출력 규칙: 최종 답변 본문만 출력한다. "
-            "'네, 알겠습니다', '수정된 답변:' 같은 메타 문구/설명/머리말은 절대 출력하지 않는다.\n\n"
             f"원문 메시지:\n{original_message}\n\n"
             f"수정 지시:\n{instruction}\n"
         )
 
+        model = select_gemini_model(task_type="reply_rewrite", doc_length=len(original_message) + len(instruction))
         response = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
+            model=model,
             contents=prompt,
             config=genai.types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT_REPLY_REWRITE,
                 max_output_tokens=520,
                 temperature=0.4,
             ),
+        )
+        _record_llm_cost_tokens(
+            _gemini_api_name(model),
+            tokens=_extract_gemini_tokens(response),
+            user_id=user_id,
+            metadata={"model": model, "feature": "reply_rewrite"},
         )
         if response and response.text:
             reply_only = _extract_reply_only(response.text)
@@ -2452,10 +3310,11 @@ def _perplexity_search(
     apply_gom_style: bool = True,
     force_single_line: bool = False,
     format_for_slack_output: bool = True,
+    user_id: Optional[str] = None,
 ) -> str:
     """Call Perplexity API with optional citation removal."""
     api_key = _required_env("PERPLEXITY_API_KEY")
-    
+
     # Select model from explicit override first, then auto-routing.
     model = model_override or select_perplexity_model(query)
 
@@ -2482,6 +3341,18 @@ def _perplexity_search(
     response.raise_for_status()
 
     data = response.json()
+    usage = data.get("usage") or {}
+    _record_llm_cost_usd(
+        _perplexity_api_name(model),
+        usd=_perplexity_per_call_usd(model),
+        user_id=user_id,
+        metadata={
+            "model": model,
+            "query_preview": _clip_text(query, 80),
+            "total_tokens": int(usage.get("total_tokens") or 0),
+        },
+    )
+
     content = (
         data.get("choices", [{}])[0]
         .get("message", {})
@@ -2569,6 +3440,7 @@ def build_app() -> App:
             respond("질문을 입력하세요. 예: /psearch reasoning-pro 팀봇 장애 분석")
             return
 
+        user_id = command.get("user_id")
         try:
             result = _perplexity_search(
                 query,
@@ -2576,6 +3448,7 @@ def build_app() -> App:
                 remove_citations=True,
                 model_override=forced_model,
                 apply_gom_style=False,
+                user_id=user_id,
             )
             respond(result)
         except requests.HTTPError as exc:
@@ -2595,6 +3468,7 @@ def build_app() -> App:
             respond(reason)
             return
 
+        user_id = command.get("user_id")
         try:
             raw_text = (command.get("text") or "").strip()
             amount, currency_code, currency_label = _parse_usdtw_input(raw_text)
@@ -2615,21 +3489,20 @@ def build_app() -> App:
                     model_override="sonar-pro",
                     apply_gom_style=False,
                     force_single_line=True,
+                    user_id=user_id,
                 )
                 respond(result)
                 return
 
-            # 환율 조회 프롬프트
-            query = (
-                "현재 미화-원화 환율을 알려주세요. "
-                "지금 기준으로 1달러는 약 00원입니다. 의 형식으로 시작하고, "
-                "최근 6개월 환율 흐름을 고려하여 현재 시점이 저점인지 고점인지 한줄 의견을 추가하세요."
-            )
+            # 환율 조회 (DM 환율 질문과 동일한 2줄 포맷 공유).
+            query = "현재 미화(USD) ↔ 원화(KRW) 환율을 알려주세요."
             result = _perplexity_search(
                 query,
-                system_prompt=SYSTEM_PROMPT_USDTW + "\n금융/환율 질문은 Perplexity Finance 데이터베이스를 최우선으로 활용한다.",
+                system_prompt=SYSTEM_PROMPT_EXCHANGE_RATE,
                 remove_citations=True,
                 model_override="sonar-pro",
+                apply_gom_style=False,
+                user_id=user_id,
             )
             respond(result)
         except requests.HTTPError as exc:
@@ -2708,7 +3581,7 @@ def build_app() -> App:
                 respond(f"자동 답변 초안 생성을 할 수 없습니다.\n{error_message}")
                 return
 
-            ok, error_message, reply_draft = _build_reply_draft_common(original_message or "")
+            ok, error_message, reply_draft = _build_reply_draft_common(original_message or "", user_id=user_id)
             if not ok:
                 respond(error_message)
                 return
@@ -2754,6 +3627,7 @@ def build_app() -> App:
             respond("요약할 내용을 입력하세요. 예: /summary 이번 주 회의 내용 ...")
             return
 
+        user_id = command.get("user_id")
         source_text = raw_text
         link = _extract_first_slack_message_link(raw_text)
         if link:
@@ -2763,12 +3637,51 @@ def build_app() -> App:
                 return
             source_text = linked_text or raw_text
 
-        summary = _gemini_generate_summary(source_text)
+        summary = _gemini_generate_summary(source_text, user_id=user_id)
         if not summary:
             respond("요약 생성에 실패했습니다. 잠시 후 다시 시도해주세요.")
             return
 
         respond(to_slack_format(summary))
+
+    @app.command("/cost")
+    def handle_cost(ack, command, respond, logger):
+        """Show today's cumulative API cost for the invoking user."""
+        ack()
+
+        allowed, reason = _is_command_allowed(command)
+        if not allowed:
+            respond(reason)
+            return
+
+        user_id = (command.get("user_id") or "").strip()
+        if not user_id:
+            respond("사용자 식별 실패. 다시 시도해주세요.")
+            return
+
+        daily = _COST_TRACKER.get_daily_summary(user_id)
+        daily_apis = {k: v for k, v in (daily.get("apis") or {}).items() if k.startswith("gemini_")}
+        daily_total = round(sum(daily_apis.values()), 4)
+        date = daily.get("date")
+
+        monthly = _COST_TRACKER.get_monthly_summary(user_id, api_name_prefix="gemini_")
+        month = monthly.get("month")
+        monthly_total = monthly.get("total_usd") or 0.0
+
+        lines = [f"*Gemini 사용량 — 오늘({date}) ${daily_total:.4f}*"]
+        if daily_apis:
+            for api_name, cost in sorted(daily_apis.items(), key=lambda kv: -kv[1]):
+                lines.append(f"• {api_name}: ${cost:.4f}")
+        else:
+            lines.append("• 오늘 집계된 Gemini 호출이 없다.")
+        lines.append(f"*이번달({month}) Gemini 누적 — ${monthly_total:.4f}*")
+        lines.append("")
+        lines.append(
+            "Perplexity 사용량은 대시보드에서 확인한다: "
+            "<https://console.perplexity.ai/group/47808882/billing|console.perplexity.ai/billing>"
+        )
+        lines.append("_주: Gemini 수치는 봇 재시작 시 초기화되는 인메모리 추정치다. 실 청구는 각 대시보드 기준._")
+        respond("\n".join(lines))
 
     @app.event("message")
     def handle_dm_free_chat_events(event, say, client, logger):
@@ -2822,6 +3735,268 @@ def build_app() -> App:
             ):
                 return
 
+            # Fortune pending registration: user previously asked for an
+            # unregistered profile and this DM is expected to carry the form
+            # response. Must be checked BEFORE keyword gates so "1997-10-15 경"
+            # isn't mis-routed to search/chat.
+            if fortune_engine.has_pending_registration(user_id):
+                # 요청자가 소유자(default 사용자) 이거나 소유자 미설정이면 즉시 저장.
+                # 그 외에는 프로필을 만들기만 하고 소유자 DM 승인 버튼으로 전달.
+                is_owner_request = (
+                    not PERSONAL_BOT_OWNER_USER_ID
+                    or user_id == PERSONAL_BOT_OWNER_USER_ID
+                )
+                result = fortune_engine.handle_registration_response(
+                    user_id, text, auto_save=is_owner_request,
+                )
+                status = result.get("status")
+                if status == "cancelled":
+                    say(to_slack_format(result.get("message") or "등록 취소됨!"))
+                    return
+                if status == "incomplete":
+                    say(to_slack_format(result.get("prompt") or ""))
+                    return
+                if status == "complete":
+                    prof = result.get("profile") or {}
+                    name = result.get("name") or ""
+                    mode_label = "수정" if result.get("mode") == "update" else "등록"
+                    say(to_slack_format(
+                        f"✅ **{name}** 프로필 {mode_label} 완료!\n"
+                        f"• 띠: {prof.get('zodiac_ko') or '미등록'}\n"
+                        f"• 별자리: {prof.get('zodiac_western') or '미등록'}\n"
+                        f"• 일간: {prof.get('ilgan') or '미등록'}\n"
+                        f"• 생년월일: {prof.get('birth_date') or '미등록'}\n\n"
+                        "곧 운세 생성할게!"
+                    ))
+                    fortune_reply = fortune_engine.build_fortune_reply(f"{name} 운세")
+                    say(to_slack_format(fortune_reply))
+                    return
+                if status == "pending_approval":
+                    prof = result.get("profile") or {}
+                    name = result.get("name") or ""
+                    mode = result.get("mode") or "create"
+                    approval_id = fortune_engine.queue_approval(
+                        requester_user_id=user_id,
+                        target_name=name,
+                        profile=prof,
+                        mode=mode,
+                    )
+                    requester_ref = f"<@{user_id}>"
+                    owner_notified = False
+                    try:
+                        owner_dm = client.conversations_open(users=PERSONAL_BOT_OWNER_USER_ID)
+                        owner_channel = (owner_dm.get("channel") or {}).get("id", "")
+                        if owner_channel:
+                            blocks = _build_fortune_approval_blocks(
+                                approval_id=approval_id,
+                                requester_ref=requester_ref,
+                                target_name=name,
+                                mode=mode,
+                                profile=prof,
+                            )
+                            fallback_preview = _format_fortune_profile_preview(prof)
+                            mode_label_owner = "수정" if mode == "update" else "신규 등록"
+                            client.chat_postMessage(
+                                channel=owner_channel,
+                                text=(
+                                    f"사주 프로필 {mode_label_owner} 승인 요청 — "
+                                    f"요청자 {requester_ref}, 대상 {name}\n"
+                                    f"{fallback_preview}\n"
+                                    f"승인 ID: {approval_id}"
+                                ),
+                                blocks=blocks,
+                            )
+                            owner_notified = True
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("fortune approval DM to owner failed: %s", exc)
+                    mode_label = "수정" if mode == "update" else "등록"
+                    if owner_notified:
+                        say(to_slack_format(
+                            f"📬 **{name}** 프로필 {mode_label} 요청을 소유자에게 전달했다!\n"
+                            f"{_format_fortune_profile_preview(prof)}\n\n"
+                            "소유자 승인 후 저장되고 운세를 뽑을 수 있어!"
+                        ))
+                    else:
+                        say(to_slack_format(
+                            f"⚠️ **{name}** 프로필 {mode_label} 요청을 대기열에 올렸지만 "
+                            "소유자에게 DM을 보내지 못했다. 관리자에게 알려달라!\n"
+                            f"승인 ID: `{approval_id}`"
+                        ))
+                    return
+                # no_pending safety fallback — let normal flow take over
+                # (this branch shouldn't occur since has_pending_registration was True)
+
+            # Fortune profile list: "프로필 목록" — 레지스트리 전체 dump
+            if fortune_engine.is_profile_list_request(text):
+                profiles = fortune_engine.list_profiles()
+                if not profiles:
+                    say(to_slack_format("등록된 프로필이 없어!"))
+                    return
+                lines = [f"**🗂 사주 프로필 레지스트리 ({len(profiles)}건)**"]
+                for key, p in profiles.items():
+                    aliases = ", ".join(p.get("aliases") or []) or "—"
+                    lines.append(
+                        f"• **{key}** (`{p.get('display_name') or key}`) · "
+                        f"별명: {aliases} · "
+                        f"생년월일: {p.get('birth_date') or '미등록'} · "
+                        f"일간: {p.get('ilgan') or '미등록'}"
+                    )
+                lines.append("")
+                lines.append("`수정: <이름> 프로필 업데이트` · `삭제: <이름> 프로필 삭제` · `신규: <이름> 사주`")
+                say(to_slack_format("\n".join(lines)))
+                return
+
+            # Fortune approval queue: "승인 대기 목록" — 소유자 전용
+            if fortune_engine.is_approval_list_request(text):
+                if PERSONAL_BOT_OWNER_USER_ID and user_id != PERSONAL_BOT_OWNER_USER_ID:
+                    say(to_slack_format(_owner_only_refusal("승인 대기 목록 조회")))
+                    return
+                pending = fortune_engine.list_pending_approvals()
+                if not pending:
+                    say(to_slack_format("승인 대기 중인 프로필 요청이 없다!"))
+                    return
+                lines = [f"**⏳ 승인 대기 요청 ({len(pending)}건)**"]
+                for aid, state in pending:
+                    prof = state.get("profile") or {}
+                    mode_label = "수정" if state.get("mode") == "update" else "등록"
+                    lines.append(
+                        f"• `{aid}` · {mode_label} · 대상: **{state.get('target_name')}** · "
+                        f"요청자: <@{state.get('requester_user_id')}> · "
+                        f"생년월일: {prof.get('birth_date') or '미등록'} · "
+                        f"일간: {prof.get('ilgan') or '미등록'}"
+                    )
+                say(to_slack_format("\n".join(lines)))
+                return
+
+            # Fortune profile delete: "이유송 프로필 삭제" — 소유자 전용
+            if fortune_engine.is_profile_delete_request(text):
+                if PERSONAL_BOT_OWNER_USER_ID and user_id != PERSONAL_BOT_OWNER_USER_ID:
+                    say(to_slack_format(_owner_only_refusal("프로필 삭제")))
+                    return
+                target = fortune_engine.extract_profile_delete_target(text)
+                if not target:
+                    say(to_slack_format(
+                        "어느 프로필을 지울지 이름을 붙여달라!\n"
+                        "예: `이유송 프로필 삭제`"
+                    ))
+                    return
+                canonical = fortune_engine.canonicalize_target(target)
+                if canonical == "default":
+                    say(to_slack_format("default 프로필은 지울 수 없어!"))
+                    return
+                removed = fortune_engine.delete_profile(canonical)
+                if removed is None:
+                    say(to_slack_format(f"`{canonical}` 프로필이 레지스트리에 없어!"))
+                    return
+                say(to_slack_format(
+                    f"🗑 **{canonical}** 프로필 삭제 완료!\n"
+                    f"• 생년월일: {removed.get('birth_date') or '미등록'}\n"
+                    f"• 일간: {removed.get('ilgan') or '미등록'}"
+                ))
+                return
+
+            # Fortune display_name rename: "default 이름을 이지인으로 수정" — 소유자 전용
+            if fortune_engine.is_display_name_update_request(text):
+                if not PERSONAL_BOT_OWNER_USER_ID or user_id != PERSONAL_BOT_OWNER_USER_ID:
+                    say(to_slack_format(_owner_only_refusal("프로필 표시명 변경")))
+                    return
+                parsed = fortune_engine.extract_display_name_update(text)
+                if not parsed:
+                    say(to_slack_format(
+                        "대상 키와 새 표시명을 인식 못 했다!\n"
+                        "예: `default 이름을 이지인으로 수정`"
+                    ))
+                    return
+                target_key, new_name = parsed
+                # 대상 키 해결 (별명/particle 스트립 포함)
+                resolved_key, resolved_profile = fortune_engine.resolve_profile(target_key)
+                if resolved_profile is None:
+                    say(to_slack_format(
+                        f"`{target_key}` 프로필을 찾지 못했다! `프로필 목록` 으로 키 확인해달라."
+                    ))
+                    return
+                old_name = resolved_profile.get("display_name") or "(없음)"
+                updated = fortune_engine.rename_display_name(resolved_key, new_name)
+                if updated is None:
+                    say(to_slack_format(f"`{resolved_key}` 프로필 표시명 변경 실패!"))
+                    return
+                say(to_slack_format(
+                    f"✅ `{resolved_key}` 표시명 변경 완료: **{old_name}** → **{new_name}**"
+                ))
+                return
+
+            # Fortune profile update request: "이유송 프로필 업데이트"
+            if fortune_engine.is_profile_update_request(text):
+                target = fortune_engine.extract_profile_update_target(text)
+                if not target:
+                    say(to_slack_format(
+                        "어느 사용자 프로필인지 알려줘!\n"
+                        "예: `이유송 프로필 업데이트`"
+                    ))
+                    return
+                canonical = fortune_engine.canonicalize_target(target)
+                _, existing = fortune_engine.resolve_profile(canonical)
+                mode = "update" if existing else "create"
+                prompt = fortune_engine.start_registration(user_id, canonical, mode=mode)
+                say(to_slack_format(prompt))
+                return
+
+            # Fortune query: intercept before weather/search. No proxy dependency.
+            # Unregistered target → start interactive registration instead.
+            if fortune_engine.is_fortune_query(text):
+                target_name = fortune_engine.extract_fortune_target(text)
+                slack_matched_key: Optional[str] = None
+
+                if target_name:
+                    resolved_key, resolved_profile = fortune_engine.resolve_profile(target_name)
+                    if resolved_profile is None:
+                        canonical = fortune_engine.canonicalize_target(target_name or "")
+                        prompt = fortune_engine.start_registration(user_id, canonical, mode="create")
+                        say(to_slack_format(prompt))
+                        return
+                else:
+                    # 텍스트에 이름이 없으면 Slack display_name 으로 3글자 풀네임 매칭
+                    slack_name = _fetch_slack_display_name(client, user_id)
+                    sk_key, sk_profile, ambiguous = fortune_engine.resolve_profile_for_slack_name(slack_name)
+                    if ambiguous:
+                        say(to_slack_format(
+                            "Slack 이름에서 여러 프로필이 매칭됐다. "
+                            "`이름 운세` 형식으로 지정해달라!"
+                        ))
+                        return
+                    if sk_profile is not None:
+                        slack_matched_key = sk_key
+
+                fortune_status_ts = ""
+                try:
+                    status_msg = client.chat_postMessage(
+                        channel=channel_id,
+                        text="운세 준비 중입니다...",
+                    )
+                    fortune_status_ts = (status_msg.get("ts") or "").strip()
+                except Exception:
+                    fortune_status_ts = ""
+
+                fortune_reply = fortune_engine.build_fortune_reply(
+                    text,
+                    target_override=slack_matched_key,
+                )
+                final_f = to_slack_format(fortune_reply)
+                if fortune_status_ts:
+                    try:
+                        client.chat_update(channel=channel_id, ts=fortune_status_ts, text=final_f)
+                    except Exception:
+                        say(final_f)
+                else:
+                    say(final_f)
+                return
+
+            # k-skill intent gates — subway / stock / realestate / SRT / KTX /
+            # 한강 수위 / 날씨. 매칭되면 dispatch 가 직접 응답을 게시하고 True 반환.
+            # 동일 헬퍼를 app_mention 핸들러에서도 재사용해 그룹 DM @멘션에서도 동작한다.
+            if _dispatch_skill_intent(text, channel_id, client):
+                return
+
             use_search_engine = _looks_like_search_request(text)
             status_text = "검색 중입니다..." if use_search_engine else "답변 생성 중입니다..."
 
@@ -2836,9 +4011,9 @@ def build_app() -> App:
                 status_ts = ""
 
             if use_search_engine:
-                reply = _perplexity_chat_dm(text, recent_context=recent_context)
+                reply = _perplexity_chat_dm(text, recent_context=recent_context, user_id=user_id)
             else:
-                reply = _gemini_chat_dm(text, recent_context=recent_context)
+                reply = _gemini_chat_dm(text, recent_context=recent_context, user_id=user_id)
             if not reply:
                 fail_text = "답변 생성에 실패했습니다. 잠시 후 다시 시도해주세요."
                 if status_ts:
@@ -2884,6 +4059,11 @@ def build_app() -> App:
                 )
                 return
 
+            # k-skill intent gates (공용 헬퍼). 그룹 DM(mpim)에서도 동일 동작.
+            # 매칭 안되거나 weather intent 만 있고 proxy 가 None 반환하면 fall through.
+            if _dispatch_skill_intent(prompt_text, channel_id, client, user_id=user_id):
+                return
+
             recent_context = _build_recent_channel_context(
                 client,
                 channel_id=channel_id,
@@ -2903,9 +4083,9 @@ def build_app() -> App:
             status_ts = (status_msg.get("ts") or "").strip()
 
             if use_search_engine:
-                reply = _perplexity_chat_dm(prompt_text, recent_context=recent_context)
+                reply = _perplexity_chat_dm(prompt_text, recent_context=recent_context, user_id=user_id)
             else:
-                reply = _gemini_chat_dm(prompt_text, recent_context=recent_context)
+                reply = _gemini_chat_dm(prompt_text, recent_context=recent_context, user_id=user_id)
 
             if not reply:
                 client.chat_update(
@@ -2964,7 +4144,7 @@ def build_app() -> App:
                 logger.warning(f"Shortcut source fetch failed: {error_message}")
                 return
 
-            ok, error_message, reply_draft = _build_reply_draft_common(original_message or "")
+            ok, error_message, reply_draft = _build_reply_draft_common(original_message or "", user_id=user_id)
             if not ok:
                 logger.warning(f"Shortcut draft generation failed: {error_message}")
                 return
@@ -3084,7 +4264,7 @@ def build_app() -> App:
                 )
                 return
 
-            rewritten = _rewrite_reply_draft(session.get("original_message", ""), instruction)
+            rewritten = _rewrite_reply_draft(session.get("original_message", ""), instruction, user_id=user_id)
             if not rewritten:
                 client.chat_postMessage(
                     channel=session["dm_channel_id"],
@@ -3143,6 +4323,147 @@ def build_app() -> App:
             )
         except Exception as exc:
             logger.exception(f"workflow_step_reject action failed: {exc}")
+
+    @app.action("fortune_profile_approve")
+    def handle_fortune_profile_approve(ack, body, client, logger):
+        """소유자가 사주 프로필 등록 요청을 승인."""
+        ack()
+        try:
+            actor_id = (body.get("user", {}).get("id") or "").strip()
+            approval_id = (body.get("actions", [{}])[0].get("value") or "").strip()
+            dm_channel_id = (body.get("channel", {}).get("id") or "").strip()
+            message_ts = (body.get("message", {}).get("ts") or "").strip()
+            if not actor_id or not approval_id:
+                return
+            if PERSONAL_BOT_OWNER_USER_ID and actor_id != PERSONAL_BOT_OWNER_USER_ID:
+                if dm_channel_id:
+                    client.chat_postMessage(
+                        channel=dm_channel_id,
+                        text="이 승인은 소유자(default 사용자)만 처리할 수 있어!",
+                    )
+                return
+            pending = fortune_engine.get_pending_approval(approval_id)
+            if not pending:
+                if dm_channel_id:
+                    client.chat_postMessage(
+                        channel=dm_channel_id,
+                        text=f"승인 요청 `{approval_id}` 은 이미 처리됐거나 만료됐어!",
+                    )
+                return
+            state = fortune_engine.approve_pending(approval_id)
+            if not state:
+                return
+            name = state["target_name"]
+            mode = state.get("mode", "create")
+            requester_id = state["requester_user_id"]
+            profile = state["profile"]
+            mode_label = "수정" if mode == "update" else "등록"
+            if dm_channel_id and message_ts:
+                try:
+                    client.chat_update(
+                        channel=dm_channel_id,
+                        ts=message_ts,
+                        text=f"✅ 사주 프로필 {mode_label} 승인 완료 — {name}",
+                        blocks=[
+                            {
+                                "type": "section",
+                                "text": {
+                                    "type": "mrkdwn",
+                                    "text": (
+                                        f"✅ *사주 프로필 {mode_label} 승인 완료*\n"
+                                        f"대상: *{name}* · 요청자: <@{requester_id}>\n\n"
+                                        f"{_format_fortune_profile_preview(profile)}"
+                                    ),
+                                },
+                            }
+                        ],
+                    )
+                except Exception:
+                    pass
+            # 요청자에게 승인 결과 통지
+            try:
+                req_dm = client.conversations_open(users=requester_id)
+                req_channel = (req_dm.get("channel") or {}).get("id", "")
+                if req_channel:
+                    client.chat_postMessage(
+                        channel=req_channel,
+                        text=to_slack_format(
+                            f"✅ **{name}** 프로필 {mode_label} 요청이 승인됐어!\n"
+                            f"{_format_fortune_profile_preview(profile)}\n\n"
+                            f"`{name} 운세` 또는 `{name} 사주` 로 물어보면 바로 뽑아줄게."
+                        ),
+                    )
+            except Exception as exc:
+                logger.warning(f"fortune approval requester DM failed: {exc}")
+        except Exception as exc:
+            logger.exception(f"fortune_profile_approve failed: {exc}")
+
+    @app.action("fortune_profile_reject")
+    def handle_fortune_profile_reject(ack, body, client, logger):
+        """소유자가 사주 프로필 등록 요청을 거부."""
+        ack()
+        try:
+            actor_id = (body.get("user", {}).get("id") or "").strip()
+            approval_id = (body.get("actions", [{}])[0].get("value") or "").strip()
+            dm_channel_id = (body.get("channel", {}).get("id") or "").strip()
+            message_ts = (body.get("message", {}).get("ts") or "").strip()
+            if not actor_id or not approval_id:
+                return
+            if PERSONAL_BOT_OWNER_USER_ID and actor_id != PERSONAL_BOT_OWNER_USER_ID:
+                if dm_channel_id:
+                    client.chat_postMessage(
+                        channel=dm_channel_id,
+                        text="이 승인은 소유자(default 사용자)만 처리할 수 있어!",
+                    )
+                return
+            state = fortune_engine.reject_pending(approval_id)
+            if not state:
+                if dm_channel_id:
+                    client.chat_postMessage(
+                        channel=dm_channel_id,
+                        text=f"승인 요청 `{approval_id}` 은 이미 처리됐거나 만료됐어!",
+                    )
+                return
+            name = state["target_name"]
+            mode = state.get("mode", "create")
+            requester_id = state["requester_user_id"]
+            mode_label = "수정" if mode == "update" else "등록"
+            if dm_channel_id and message_ts:
+                try:
+                    client.chat_update(
+                        channel=dm_channel_id,
+                        ts=message_ts,
+                        text=f"❌ 사주 프로필 {mode_label} 거부됨 — {name}",
+                        blocks=[
+                            {
+                                "type": "section",
+                                "text": {
+                                    "type": "mrkdwn",
+                                    "text": (
+                                        f"❌ *사주 프로필 {mode_label} 거부*\n"
+                                        f"대상: *{name}* · 요청자: <@{requester_id}>"
+                                    ),
+                                },
+                            }
+                        ],
+                    )
+                except Exception:
+                    pass
+            try:
+                req_dm = client.conversations_open(users=requester_id)
+                req_channel = (req_dm.get("channel") or {}).get("id", "")
+                if req_channel:
+                    client.chat_postMessage(
+                        channel=req_channel,
+                        text=to_slack_format(
+                            f"❌ **{name}** 프로필 {mode_label} 요청이 거부됐다.\n"
+                            "필요하면 소유자에게 사유를 물어본 뒤 다시 요청해달라!"
+                        ),
+                    )
+            except Exception as exc:
+                logger.warning(f"fortune rejection requester DM failed: {exc}")
+        except Exception as exc:
+            logger.exception(f"fortune_profile_reject failed: {exc}")
 
     @app.action("direct_send_approve")
     def handle_direct_send_approve(ack, body, client, logger):

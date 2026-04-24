@@ -102,8 +102,11 @@ pip install -r requirements.txt
 # 현재는 스크립트로 직접 실행한다.
 python apps/slack-bot/main.py
 
-# Socket Mode runner (터미널 2)
+# Socket Mode runner — 오케스트레이터(임곰🐻‍❄️, 터미널 2)
 python apps/slack-bot/socket_mode_runner.py
+
+# Socket Mode runner — 개인봇(쥐피티🐹, /psearch·/usdtw·/reply·/summary, 터미널 3)
+python apps/personal-bot/socket_mode_runner.py
 
 # Celery Worker — 현재 태스크 데코레이터 없음 (Phase 5 대상)
 # celery -A services.orchestrator.tasks worker --loglevel=info

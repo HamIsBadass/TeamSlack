@@ -17,14 +17,18 @@ logger = logging.getLogger(__name__)
 class ApiCostTracker:
     """Track API costs in memory with thread-safe access."""
 
-    # Cost per 1K tokens (estimated)
+    # Blended cost per 1K tokens (rough estimate; actual billing comes from provider).
+    # Sourced from public pricing as of 2025-Q3; update when providers change rates.
     COST_MAPPING = {
-        "perplexity_research": 0.020,  # $0.02 per research query
-        "perplexity_standard": 0.005,  # $0.005 per standard query
-        "gemini_flash": 0.000075,  # $0.075 per 1M tokens ≈ $0.000075 per 1K tokens
-        "gemini_pro": 0.00015,  # $0.15 per 1M tokens
-        "openai_gpt4_turbo": 0.001,  # $0.01 per 1K input tokens
-        "openai_gpt35": 0.0005,  # $0.0005 per 1K input tokens
+        # Perplexity: per-query estimate (provider bills per query, not tokens).
+        "perplexity_research": 0.020,      # sonar-reasoning / sonar-pro 계열 ≈ $0.02/query
+        "perplexity_standard": 0.005,      # sonar 기본 ≈ $0.005/query
+        # Gemini 2.5 family: approximate blended in+out per 1K tokens.
+        "gemini_flash_lite": 0.00025,      # $0.10 in / $0.40 out per 1M
+        "gemini_flash": 0.0014,            # $0.30 in / $2.50 out per 1M
+        "gemini_pro": 0.0056,              # $1.25 in / $10.00 out per 1M
+        "openai_gpt4_turbo": 0.001,
+        "openai_gpt35": 0.0005,
     }
 
     def __init__(self):
@@ -153,6 +157,42 @@ class ApiCostTracker:
                 "date": date,
                 "apis": {k: round(v, 4) for k, v in apis.items()},
                 "total_usd": round(total, 2),
+            }
+
+    def get_monthly_summary(
+        self,
+        user_id: str,
+        month: Optional[str] = None,
+        api_name_prefix: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Sum daily costs for a user within a YYYY-MM window.
+
+        Args:
+            user_id: Slack user ID
+            month: "YYYY-MM" (default: current UTC month)
+            api_name_prefix: if set, only api_name starting with this prefix is counted
+                (e.g., "gemini_" to exclude Perplexity).
+        """
+        if month is None:
+            month = datetime.utcnow().strftime("%Y-%m")
+
+        with self._lock:
+            user_days = self._user_daily_costs.get(user_id, {})
+            apis: Dict[str, float] = defaultdict(float)
+            for date, day_apis in user_days.items():
+                if not date.startswith(month):
+                    continue
+                for api_name, cost in day_apis.items():
+                    if api_name_prefix and not api_name.startswith(api_name_prefix):
+                        continue
+                    apis[api_name] += cost
+
+            total = sum(apis.values())
+            return {
+                "user_id": user_id,
+                "month": month,
+                "apis": {k: round(v, 4) for k, v in apis.items()},
+                "total_usd": round(total, 4),
             }
 
     def get_session_summary(self, session_id: str) -> Dict[str, Any]:

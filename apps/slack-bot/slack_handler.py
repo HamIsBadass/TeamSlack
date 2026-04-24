@@ -19,9 +19,30 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from message_templates import (
+    ORCHESTRATOR_APPROVAL_HELP,
+    ORCHESTRATOR_REQUEST_RECEIVED,
+)
 from services.orchestrator.orchestrator import Orchestrator
+from shared.profile import Persona, get_persona
 
 logger = logging.getLogger(__name__)
+
+
+# 상태별 발화 페르소나 매핑. 파이프라인 단계 종료 직후의 상태는 해당 단계를
+# 수행한 워커가 말하는 것처럼 보이도록 연기하고, 그 외 단계(접수/승인/완료)는
+# 총괄인 오케스트레이터가 담당한다.
+_STATUS_PERSONA: Dict[str, str] = {
+    "MEETING_DONE": "meeting",
+    "JIRA_DRAFTED": "jira",
+    "REVIEW_DONE": "review",
+}
+
+
+def _persona_for_status(status: str) -> Persona:
+    """Return the persona whose voice should narrate the given status."""
+    persona_id = _STATUS_PERSONA.get((status or "").strip().upper(), "orchestrator")
+    return get_persona(persona_id)
 
 
 class SlackHandler:
@@ -118,8 +139,54 @@ class SlackHandler:
             "trace_id": result["trace_id"],
         }
 
+    # Statuses whose messages go to the full team. Everything else is ephemeral
+    # to the requester only.
+    PUBLIC_STATUSES = frozenset({"APPROVED", "DONE"})
+
+    def _post_to_channel(
+        self,
+        channel_id: str,
+        user_id: Optional[str],
+        text: str,
+        thread_ts: Optional[str] = None,
+        visibility: str = "ephemeral",
+        blocks: Optional[list] = None,
+    ) -> Optional[str]:
+        """Post to a channel, honoring the visibility flag.
+
+        Returns the root message ts (only meaningful for public posts; ephemeral
+        responses return message_ts which is not a valid parent thread_ts).
+        """
+        if not self.slack_client:
+            return None
+        if visibility == "ephemeral" and not user_id:
+            logger.warning("ephemeral post requested without user_id; falling back to public")
+            visibility = "public"
+
+        kwargs: Dict[str, Any] = {"channel": channel_id, "text": text}
+        if thread_ts:
+            kwargs["thread_ts"] = thread_ts
+        if blocks:
+            kwargs["blocks"] = blocks
+
+        try:
+            if visibility == "ephemeral":
+                kwargs["user"] = user_id
+                resp = self.slack_client.chat_postEphemeral(**kwargs)
+                return resp.get("message_ts") or ""
+            resp = self.slack_client.chat_postMessage(**kwargs)
+            return resp.get("ts") or ""
+        except SlackApiError:
+            logger.exception("Slack post failed (visibility=%s)", visibility)
+            return None
+
     def _notify_orchestration_channel(self, request: Dict[str, Any]) -> str:
-        """Post the incoming request into the orchestration channel for visibility."""
+        """Post the incoming request into the orchestration channel.
+
+        The root message is public but minimal — it only establishes the thread
+        and tags the requester. The actual request content is posted as an
+        ephemeral follow-up visible to the requester only.
+        """
         if not self.slack_client or not self.orchestration_channel_id:
             return ""
 
@@ -132,26 +199,40 @@ class SlackHandler:
             preview = preview.rstrip() + "..."
 
         bot_prefix = f"<@{self.orchestration_bot_user_id}> " if self.orchestration_bot_user_id else ""
+        orchestrator_persona = get_persona("orchestrator")
         root_text = (
-            f"{bot_prefix}<@{user_id}> 요청 1건\n"
-            f"request_id: {request_id[:8]}\n"
+            f"{bot_prefix}<@{user_id}> 요청 1건 처리 중\n"
+            f"request_id: {request_id[:8]}"
+        )
+        thread_ts = self._post_to_channel(
+            channel_id=self.orchestration_channel_id,
+            user_id=user_id,
+            text=root_text,
+            visibility="public",
+        )
+        if not thread_ts:
+            return ""
+
+        detail_text = (
+            f"{orchestrator_persona.header_label()}\n"
+            f"요청 상세 (본인만 보임)\n"
             f"trace_id: {trace_id[:8]}\n"
             f"status: {request.get('status', 'RECEIVED')}\n"
             f"내용: {preview or '내용 없음'}"
         )
-
-        response = self.slack_client.chat_postMessage(
-            channel=self.orchestration_channel_id,
-            text=root_text,
-        )
-        thread_ts = (response.get("ts") or "").strip()
-        if not thread_ts:
-            return ""
-
-        self.slack_client.chat_postMessage(
-            channel=self.orchestration_channel_id,
+        self._post_to_channel(
+            channel_id=self.orchestration_channel_id,
+            user_id=user_id,
+            text=detail_text,
             thread_ts=thread_ts,
-            text="오케스트레이터: 요청을 확인했다. PARSING 단계로 넘긴다.",
+            visibility="ephemeral",
+        )
+        self._post_to_channel(
+            channel_id=self.orchestration_channel_id,
+            user_id=user_id,
+            text=f"{orchestrator_persona.header_label()}\n{ORCHESTRATOR_REQUEST_RECEIVED}",
+            thread_ts=thread_ts,
+            visibility="ephemeral",
         )
 
         return thread_ts
@@ -315,24 +396,29 @@ class SlackHandler:
 
         channel_id = (request.get("slack_channel_id") or self.orchestration_channel_id or "").strip()
         thread_ts = (request.get("slack_thread_ts") or "").strip()
+        user_id = (request.get("user_id") or "").strip()
         if not channel_id or not thread_ts:
             return False
 
         short_id = request_id[:8]
         status_text = status or request.get("status", "UNKNOWN")
         step_text = current_step or request.get("current_step", "UNKNOWN")
+        visibility = "public" if status_text in self.PUBLIC_STATUSES else "ephemeral"
+        persona = _persona_for_status(status_text)
         message = (
+            f"{persona.header_label()}\n"
             f"상태 업데이트: 요청 #{short_id}\n"
             f"status: {status_text}\n"
             f"step: {step_text}"
         )
-        self.slack_client.chat_postMessage(
-            channel=channel_id,
-            thread_ts=thread_ts,
+        posted_ts = self._post_to_channel(
+            channel_id=channel_id,
+            user_id=user_id,
             text=message,
+            thread_ts=thread_ts,
+            visibility=visibility,
         )
-
-        return True
+        return posted_ts is not None
 
     def send_approval_request(
         self,
@@ -369,22 +455,29 @@ class SlackHandler:
         if not channel_id or not thread_ts:
             return False
 
+        # Prefer the caller-provided user_id but fall back to the stored requester
+        # so ephemeral targeting is never silently downgraded to public.
+        user_id = (user_id or request.get("user_id") or "").strip()
+
         warning_text = "\n".join(f"• {item}" for item in warnings) if warnings else "• 특이 경고 없음"
+        orchestrator_persona = get_persona("orchestrator")
         approval_text = (
-            f"🟡 승인 대기\n"
-            f"요청 #{request_id[:8]}\n"
+            f"{orchestrator_persona.header_label()}\n"
+            f"🟡 승인 대기: 요청 #{request_id[:8]}\n"
             f"요약: {summary}\n"
             f"경고:\n{warning_text}\n\n"
-            "승인하려면 `Approve`, 수정이 필요하면 `Request Changes`, 중단하려면 `Cancel` 버튼을 사용한다."
+            f"{ORCHESTRATOR_APPROVAL_HELP}"
         )
-
-        self.slack_client.chat_postMessage(
-            channel=channel_id,
-            thread_ts=thread_ts,
+        # Approval buttons must be ephemeral to the requester only — others must
+        # not be able to click approve on someone else's request.
+        posted_ts = self._post_to_channel(
+            channel_id=channel_id,
+            user_id=user_id,
             text=approval_text,
+            thread_ts=thread_ts,
+            visibility="ephemeral",
         )
-
-        return True
+        return posted_ts is not None
 
 
 # ============ Slack payload handlers ============

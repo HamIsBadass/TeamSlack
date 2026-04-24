@@ -7,9 +7,41 @@ These templates ensure consistent, professional formatting across all bot messag
 """
 
 import logging
-from typing import Dict, List, Any
+import sys
+from pathlib import Path
+from typing import Dict, List, Any, Optional
+
+_ROOT_DIR = Path(__file__).resolve().parents[2]
+if str(_ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(_ROOT_DIR))
+
+from shared.profile import get_persona
 
 logger = logging.getLogger(__name__)
+
+
+# ============ Orchestrator (임곰🐻‍❄️) persona response templates ============
+# 페르소나 톤이 들어간 고정 응답 문구를 한 곳에 모은다. 임곰 말투(`~다곰.`)가
+# 바뀌면 이 블록만 수정하면 된다. 페르소나 규칙 자체는
+# shared/profile/personas/orchestrator.md 가 단일 진실 원천.
+
+ORCHESTRATOR_REQUEST_RECEIVED = "요청을 확인했다. PARSING 단계로 넘긴다곰."
+
+ORCHESTRATOR_APPROVAL_HELP = (
+    "승인하려면 `Approve`, 수정이 필요하면 `Request Changes`, "
+    "중단하려면 `Cancel` 버튼을 사용한다곰."
+)
+
+
+def _persona_label(persona_id: Optional[str]) -> str:
+    """Return ':emoji: display_name (persona_id)' or '' if lookup fails."""
+    if not persona_id:
+        return ""
+    try:
+        return get_persona(persona_id).header_label()
+    except (FileNotFoundError, ValueError):
+        logger.warning("Persona lookup failed for %s", persona_id)
+        return ""
 
 
 def orchestration_parent_message(
@@ -18,7 +50,8 @@ def orchestration_parent_message(
     request_type: str,
     status: str,
     current_step: str,
-    engine_flow: List[str]
+    engine_flow: List[str],
+    persona_id: Optional[str] = "orchestrator"
 ) -> Dict[str, Any]:
     """
     Create parent message for orchestration channel.
@@ -58,6 +91,8 @@ def orchestration_parent_message(
     
     status_emoji_str = status_emoji.get(status, "❓")
     short_id = str(request_id)[:8]
+    persona_label = _persona_label(persona_id)
+    header_prefix = f"{persona_label} · " if persona_label else ""
     
     # Build progress bar
     step_indicators = []
@@ -80,7 +115,7 @@ def orchestration_parent_message(
         "type": "header",
         "text": {
             "type": "plain_text",
-            "text": f"{status_emoji_str} 요청 #{short_id}",
+            "text": f"{header_prefix}{status_emoji_str} 요청 #{short_id}",
             "emoji": True
         }
     }
@@ -90,7 +125,8 @@ def approval_message(
     request_id: str,
     summary: str,
     warnings: List[str],
-    api_cost_footer: str = ""
+    api_cost_footer: str = "",
+    persona_id: Optional[str] = "orchestrator"
 ) -> Dict[str, Any]:
     """
     Create approval request message with Block Kit buttons.
@@ -114,14 +150,16 @@ def approval_message(
     logger.info(f"Creating approval message for {request_id}")
     
     short_id = str(request_id)[:8]
+    persona_label = _persona_label(persona_id)
+    header_prefix = f"{persona_label} · " if persona_label else ""
     blocks = []
-    
+
     # Header
     blocks.append({
         "type": "header",
         "text": {
             "type": "plain_text",
-            "text": f"🟡 승인 대기: 요청 #{short_id}",
+            "text": f"{header_prefix}🟡 승인 대기: 요청 #{short_id}",
             "emoji": True
         }
     })
@@ -346,7 +384,8 @@ def status_update_message(
     request_id: str,
     old_status: str,
     new_status: str,
-    timestamp: str
+    timestamp: str,
+    persona_id: Optional[str] = None
 ) -> str:
     """
     Create status update message for Slack thread.
@@ -375,8 +414,10 @@ def status_update_message(
     
     emoji = status_emoji.get(new_status, "•")
     time_str = timestamp.split("T")[1].split(".")[0]  # HH:MM:SS
-    
-    return f"{emoji} [{time_str}] 상태 변경: {old_status} → {new_status}"
+    persona_label = _persona_label(persona_id)
+    prefix = f"{persona_label} · " if persona_label else ""
+
+    return f"{prefix}{emoji} [{time_str}] 상태 변경: {old_status} → {new_status}"
 
 
 # ============ Block Kit helpers ============

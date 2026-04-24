@@ -137,7 +137,7 @@
 
 ## 8. 관련 파일
 
-- `apps/slack-bot/socket_mode_runner.py`
+- `apps/personal-bot/socket_mode_runner.py` — `/reply` 이전 이후 실 구현 위치
 - `requirements.txt`
 - `shared/utils/model_router.py`
 - `.env.example`

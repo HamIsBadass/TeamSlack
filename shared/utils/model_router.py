@@ -66,17 +66,23 @@ def select_perplexity_model(query: str) -> str:
     return "sonar"
 
 
-def select_gemini_model(task_type: str, doc_length: int = 0) -> str:
+GEMINI_HEAVY_TASKS = {"review", "code_review", "long_summary", "architecture"}
+GEMINI_MID_TASKS = {"summary", "reply_rewrite", "analyze"}
+
+
+def select_gemini_model(task_type: str = "", doc_length: int = 0) -> str:
     """Select Gemini model by workload complexity.
-    
-    2025-04-13: Updated to use gemini-2.5 models (gemini-2.0 deprecated).
-    - gemini-2.5-pro: Heavy tasks (code review, architecture), long documents (>3000 chars)
-    - gemini-2.5-flash: Default for most tasks, lightweight responses
+
+    Tier policy (2026-04-21):
+    - gemini-2.5-pro: heavy reasoning (code review, architecture, long docs >3000 chars)
+    - gemini-2.5-flash: mid-weight tasks (summary, rewrite with long context >800 chars)
+    - gemini-2.5-flash-lite: default short-turn drafts/chat (cheapest, fastest)
     """
-    heavy_tasks = {"review", "code_review", "long_summary", "architecture"}
-    if task_type in heavy_tasks or doc_length > 3000:
+    if task_type in GEMINI_HEAVY_TASKS or doc_length > 3000:
         return "gemini-2.5-pro"
-    return "gemini-2.5-flash"
+    if task_type in GEMINI_MID_TASKS or doc_length > 800:
+        return "gemini-2.5-flash"
+    return "gemini-2.5-flash-lite"
 
 
 def parse_psearch_input(text: str) -> Tuple[str, Optional[str]]:

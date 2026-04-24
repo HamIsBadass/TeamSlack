@@ -14,4 +14,4 @@ else
   exit 1
 fi
 
-exec python apps/slack-bot/socket_mode_runner.py
+exec python apps/personal-bot/socket_mode_runner.py
