@@ -20,19 +20,6 @@ from shared.profile import get_persona
 logger = logging.getLogger(__name__)
 
 
-# ============ Orchestrator (임곰🐻‍❄️) persona response templates ============
-# 페르소나 톤이 들어간 고정 응답 문구를 한 곳에 모은다. 임곰 말투(`~다곰.`)가
-# 바뀌면 이 블록만 수정하면 된다. 페르소나 규칙 자체는
-# shared/profile/personas/orchestrator.md 가 단일 진실 원천.
-
-ORCHESTRATOR_REQUEST_RECEIVED = "요청을 확인했다. PARSING 단계로 넘긴다곰."
-
-ORCHESTRATOR_APPROVAL_HELP = (
-    "승인하려면 `Approve`, 수정이 필요하면 `Request Changes`, "
-    "중단하려면 `Cancel` 버튼을 사용한다곰."
-)
-
-
 def _persona_label(persona_id: Optional[str]) -> str:
     """Return ':emoji: display_name (persona_id)' or '' if lookup fails."""
     if not persona_id:
