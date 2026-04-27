@@ -149,3 +149,6 @@ dmypy.json
 # Personal-bot fortune profile registry (PII: real birthdates).
 # Only the example template is committed; real registry stays local.
 apps/personal-bot/fortune_profiles.json
+
+# Forward opt-out list (user preference, treats Slack user_ids as private).
+apps/slack-bot/forward_blocklist.json

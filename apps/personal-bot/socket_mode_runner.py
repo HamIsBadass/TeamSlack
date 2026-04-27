@@ -32,6 +32,7 @@ from shared.profile import get_persona
 from shared.api_cost_tracker import get_cost_tracker
 
 import fortune_engine  # noqa: E402  — same-directory module
+import forward_engine  # noqa: E402  — same-directory module
 import hanriver_engine  # noqa: E402  — same-directory module
 import ktx_engine  # noqa: E402  — same-directory module
 import realestate_engine  # noqa: E402  — same-directory module
@@ -244,8 +245,15 @@ ENFORCE_ALLOWLIST = os.getenv("SLACK_ENFORCE_ALLOWLIST", "0").strip() == "1"
 PENDING_REPLY_INPUTS: Dict[str, Dict[str, str]] = {}
 LAST_REPLY_DRAFTS: Dict[str, Dict[str, str]] = {}
 REPLY_SHORTCUT_SESSIONS: Dict[str, Dict[str, str]] = {}
-PENDING_DIRECT_SENDS: Dict[str, Dict[str, str]] = {}
 PENDING_TASK_WORKFLOWS: Dict[str, Dict[str, str]] = {}
+# DEPRECATED: direct_send 플로우는 forward_engine 으로 통합됨. 아래 dict 와 관련 함수는
+# dead code 로 남아 있지만 import-time 참조 오류 방지를 위해 선언만 유지. 후속 PR 에서
+# `_handle_direct_send_request`, `_extract_direct_send_request`,
+# `_build_direct_send_approval_blocks`, `_format_direct_send_approval_text`,
+# `_send_direct_message_to_target`, `_build_direct_send_prompt_state`,
+# `_ask_direct_send_followup`, `_pending_direct_send_key`,
+# `direct_send_approve/reject` 액션 핸들러와 함께 일괄 제거.
+PENDING_DIRECT_SENDS: Dict[str, Dict[str, str]] = {}
 CHANNEL_RESOLUTION_CACHE: Dict[str, str] = {}
 USER_RESOLUTION_CACHE: Dict[str, str] = {}
 # user_id → Slack display_name (or real_name fallback). 운세 Slack 매칭용 얕은 캐시.
@@ -1784,6 +1792,7 @@ def _build_recent_channel_context(client, channel_id: str, latest_ts: str, reque
 
 
 def _pending_direct_send_key(user_id: str) -> str:
+    """DEPRECATED: direct_send 플로우 잔재. 후속 PR 에서 제거."""
     return user_id.strip()
 
 
@@ -1975,6 +1984,7 @@ def _resolve_user_reference(client, user_ref: str) -> Tuple[bool, str, Optional[
 
 
 def _looks_like_user_reference(text: str) -> bool:
+    """DEPRECATED: direct_send 잔재. 후속 PR 에서 제거."""
     raw = (text or "").strip()
     if _extract_user_id_from_reference(raw):
         return True
@@ -1982,10 +1992,12 @@ def _looks_like_user_reference(text: str) -> bool:
 
 
 def _looks_like_delivery_target(text: str) -> bool:
+    """DEPRECATED."""
     return _looks_like_channel_reference(text) or _looks_like_user_reference(text)
 
 
 def _display_delivery_target(target_ref: str) -> str:
+    """DEPRECATED."""
     user_id = _extract_user_id_from_reference(target_ref)
     if user_id:
         return f"<@{user_id}> DM"
@@ -1995,6 +2007,7 @@ def _display_delivery_target(target_ref: str) -> str:
 
 
 def _extract_last_bot_message(recent_context: str) -> str:
+    """DEPRECATED."""
     lines = [line.strip() for line in (recent_context or "").splitlines() if line.strip()]
     for line in reversed(lines):
         if line.startswith("봇:"):
@@ -2003,11 +2016,16 @@ def _extract_last_bot_message(recent_context: str) -> str:
 
 
 def _extract_direct_send_request(text: str) -> Tuple[Optional[str], Optional[str], bool]:
+    """DEPRECATED: direct_send 플로우는 forward_engine 으로 통합. 후속 PR 에서 함께 제거."""
     normalized = (text or "").strip()
     if not normalized:
         return None, None, False
 
-    trigger_verbs = ["보내주세요", "전송해주세요", "발송해주세요", "보내줘", "전송해줘", "발송해줘", "보내", "전송", "발송"]
+    trigger_verbs = [
+        "보내주세요", "전송해주세요", "발송해주세요", "전달해주세요",
+        "보내줘", "전송해줘", "발송해줘", "전달해줘",
+        "보내", "전송", "발송", "전달",
+    ]
     trigger_index = -1
     trigger_verb = ""
     for verb in trigger_verbs:
@@ -2125,6 +2143,10 @@ def _format_direct_send_approval_text(channel_ref: str, message_text: str) -> st
 
 def _build_direct_send_approval_blocks(*, target_ref: str, message_text: str, pending_key: str) -> list[dict[str, Any]]:
     target_label = _display_delivery_target(target_ref)
+    # Slack section mrkdwn 은 3000자 상한. 긴 메시지는 preview 용도로만 잘라서 표시.
+    preview = message_text or "(내용 없음)"
+    if len(preview) > 2400:
+        preview = preview[:2400].rstrip() + "\n… (미리보기 생략, 실제 발송은 원문 전체)"
     return [
         {
             "type": "section",
@@ -2137,7 +2159,8 @@ def _build_direct_send_approval_blocks(*, target_ref: str, message_text: str, pe
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"*메시지*\n{to_slack_format(message_text)}",
+                # message_text 는 이미 Slack 포맷(*bold*/_italic_). 재변환 금지.
+                "text": f"*메시지*\n{preview}",
             },
         },
         {
@@ -2573,9 +2596,11 @@ def _send_direct_message_to_target(
                     )
                     return False, False
 
+                # message_text 는 이미 Slack 포맷 소스(*bold*/_italic_). to_slack_format
+                # 을 재적용하면 *bold* 가 italic 으로 오염되므로 원문 그대로 전송.
                 post_result = client.chat_postMessage(
                     channel=dm_channel_id,
-                    text=to_slack_format(message_text),
+                    text=message_text,
                 )
                 if not bool((post_result or {}).get("ok", True)):
                     client.chat_postMessage(
@@ -3014,11 +3039,42 @@ def _handle_direct_send_request(
         return True
 
     channel_ref, message_text, has_send_intent = _extract_direct_send_request(text)
+    logger.info(
+        "direct_send extract: intent=%s channel_ref=%r msg_len=%d",
+        has_send_intent, channel_ref, len(message_text or ""),
+    )
     if not has_send_intent:
         return False
 
     if not message_text:
-        message_text = _extract_last_bot_message(recent_context)
+        # recent_context 기반 `_extract_last_bot_message` 는 _to_single_line 로 개행을
+        # 공백으로 치환하고 600자에서 자르므로 긴 운세/답변이 끊겨서 들어온다. 대신
+        # conversations_history 에서 원문 그대로 직전 봇 응답을 가져온다.
+        try:
+            hist = client.conversations_history(
+                channel=user_dm_channel_id, limit=10,
+            )
+            msgs = hist.get("messages") or []
+            logger.info("direct_send history: msg_count=%d", len(msgs))
+            last_msg = forward_engine.capture_last_bot_message(
+                msgs, requester_user_id=user_id,
+            )
+            if last_msg and last_msg.get("text"):
+                message_text = last_msg["text"]
+                logger.info(
+                    "direct_send captured last bot msg: len=%d",
+                    len(message_text),
+                )
+            else:
+                logger.info("direct_send capture returned None/empty")
+        except Exception as exc:
+            logger.warning(f"direct_send history fetch failed: {exc}")
+        if not message_text:
+            message_text = _extract_last_bot_message(recent_context)
+            logger.info(
+                "direct_send fallback recent_context: msg_len=%d",
+                len(message_text or ""),
+            )
 
     if channel_ref and message_text:
         PENDING_DIRECT_SENDS[pending_key] = _build_direct_send_prompt_state(
@@ -3032,11 +3088,18 @@ def _handle_direct_send_request(
             message_text=message_text,
             pending_key=pending_key,
         )
-        client.chat_postMessage(
-            channel=user_dm_channel_id,
-            text=_format_direct_send_approval_text(channel_ref, message_text),
-            blocks=blocks,
-        )
+        try:
+            posted = client.chat_postMessage(
+                channel=user_dm_channel_id,
+                text=_format_direct_send_approval_text(channel_ref, message_text),
+                blocks=blocks,
+            )
+            logger.info(
+                "direct_send preview posted: ok=%s block_count=%d",
+                bool((posted or {}).get("ok", True)), len(blocks),
+            )
+        except Exception as exc:
+            logger.exception(f"direct_send preview post FAILED: {exc}")
         return True
 
     if channel_ref and not message_text:
@@ -3726,14 +3789,8 @@ def build_app() -> App:
             ):
                 return
 
-            if _handle_direct_send_request(
-                client,
-                user_id=user_id,
-                user_dm_channel_id=channel_id,
-                text=text,
-                recent_context=recent_context,
-            ):
-                return
+            # direct_send 는 폐지. "@X 발송" / "@X 전달" 등 모든 발송 요청은 아래
+            # forward_engine 경로로 일원화된다 (단일 사용자 확인 버튼 후 직접 발송).
 
             # Fortune pending registration: user previously asked for an
             # unregistered profile and this DM is expected to carry the form
@@ -3939,6 +3996,80 @@ def build_app() -> App:
                 mode = "update" if existing else "create"
                 prompt = fortune_engine.start_registration(user_id, canonical, mode=mode)
                 say(to_slack_format(prompt))
+                return
+
+            # Forward opt-out/opt-in 키워드는 임곰(slack-bot) 이 처리한다. personal-bot
+            # 과 slack-bot 이 같은 Slack 앱 토큰을 공유하므로 두 봇이 DM 이벤트를 동시에
+            # 수신한다 — 여기서 조기 return 하지 않으면 Gemini 가 엉뚱한 답변을 만들어
+            # 이중 응답이 발생한다.
+            _forward_optout_kw = (
+                "전달 금지", "전달 차단", "전달 허용", "전달 해제",
+                "포워드 금지", "포워드 허용",
+            )
+            if any(kw in text for kw in _forward_optout_kw):
+                return
+
+            # Forward/Send 통합 플로우: "<@U> 전달", "<#C> 보내", "[채널] 발송" 모두 여기로.
+            # direct_send 는 폐지되고 이 경로로 일원화됨. 사용자 확인 버튼(발송/취소)을
+            # 거쳐야만 실제 발송되므로 임곰 검토 없이도 안전.
+            if forward_engine.is_forward_request(text):
+                target = forward_engine.extract_target(text)
+                if not target:
+                    say(to_slack_format(
+                        "전달 대상을 인식 못 했다!\n"
+                        "예: `<@U12345> 에게 전달`, `<#C123> 발송`, `[팀-공지] 보내` :hamster:"
+                    ))
+                    return
+                target_type, target_ref, target_display = target
+                if target_type == "user" and target_ref == f"<@{user_id}>":
+                    say(to_slack_format("본인에게는 전달할 필요 없다! :hamster:"))
+                    return
+                # DM 최근 히스토리에서 직전 bot 응답 캡처
+                try:
+                    hist = client.conversations_history(
+                        channel=channel_id,
+                        latest=(event.get("ts") or "").strip(),
+                        inclusive=False,
+                        limit=10,
+                    )
+                    hist_msgs = hist.get("messages") or []
+                except Exception as exc:
+                    logger.warning(f"forward: conversations_history failed: {exc}")
+                    hist_msgs = []
+                last_msg = forward_engine.capture_last_bot_message(
+                    hist_msgs, requester_user_id=user_id,
+                )
+                if not last_msg:
+                    say(to_slack_format(
+                        "직전 봇 응답을 못 찾았다! 전달할 내용이 DM 에 있어야 한다 :hamster:"
+                    ))
+                    return
+                rid = forward_engine.queue_forward(
+                    sender_user_id=user_id,
+                    target_type=target_type,
+                    target_ref=target_ref,
+                    target_display=target_display,
+                    content_text=last_msg["text"],
+                    content_blocks=last_msg["blocks"],
+                    dm_channel_id=channel_id,
+                )
+                blocks = forward_engine.build_preview_blocks(
+                    request_id=rid,
+                    target_display=target_display,
+                    content_text=last_msg["text"],
+                    content_blocks=last_msg["blocks"],
+                )
+                try:
+                    posted = client.chat_postMessage(
+                        channel=channel_id,
+                        text=f"전달 확인 요청 (#{rid})",
+                        blocks=blocks,
+                    )
+                    forward_engine.set_preview_ts(rid, posted.get("ts") or "")
+                except Exception as exc:
+                    logger.exception(f"forward preview post failed: {exc}")
+                    forward_engine.pop_forward(rid)
+                    say(to_slack_format("전달 미리보기 표시에 실패했다! :hamster:"))
                 return
 
             # Fortune query: intercept before weather/search. No proxy dependency.
@@ -4464,6 +4595,114 @@ def build_app() -> App:
                 logger.warning(f"fortune rejection requester DM failed: {exc}")
         except Exception as exc:
             logger.exception(f"fortune_profile_reject failed: {exc}")
+
+    @app.action("forward_confirm")
+    def handle_forward_confirm(ack, body, client, logger):
+        """사용자가 '발송' 클릭 → target 에게 직접 DM. content 의 Slack 포맷은 mrkdwn
+        으로 그대로 전달해 볼드/이탤릭/멘션이 원문과 동일하게 렌더된다."""
+        ack()
+        try:
+            user_id = (body.get("user", {}).get("id") or "").strip()
+            rid = (body.get("actions", [{}])[0].get("value") or "").strip()
+            channel_id = (body.get("channel", {}).get("id") or "").strip()
+            msg_ts = (body.get("message", {}).get("ts") or "").strip()
+            state = forward_engine.pop_forward(rid)
+            if not state:
+                client.chat_postEphemeral(
+                    channel=channel_id,
+                    user=user_id,
+                    text="요청이 만료됐거나 이미 처리됐다! :hamster:",
+                )
+                return
+            if state.get("sender_user_id") != user_id:
+                forward_engine._PENDING_FORWARDS[rid] = state  # 되돌려 놓기
+                return
+
+            target_type = state.get("target_type") or "user"
+            target_ref = state.get("target_ref") or ""
+            target_display = state.get("target_display") or target_ref
+            delivery_text = forward_engine.build_delivery_text(
+                sender_user_id=state["sender_user_id"],
+                content_text=state.get("content_text") or "",
+            )
+            try:
+                if target_type == "user":
+                    # target_ref 는 '<@Uxxx>' 형태. user_id 부분만 추출해서 DM open.
+                    uid = target_ref.strip("<@>").split("|", 1)[0]
+                    opened = client.conversations_open(users=uid)
+                    dest = (opened.get("channel", {}) or {}).get("id") or ""
+                    if not dest:
+                        raise RuntimeError("target DM open failed")
+                elif target_type == "channel_id":
+                    dest = target_ref  # 이미 채널 ID
+                elif target_type == "channel_name":
+                    ok, err, cid = _resolve_channel_reference(client, target_ref)
+                    if not ok or not cid:
+                        raise RuntimeError(f"channel `{target_ref}` not found: {err}")
+                    dest = cid
+                else:
+                    raise RuntimeError(f"unknown target_type: {target_type}")
+                # text= 로만 보내면 Slack 이 원본 mrkdwn(*bold*/_italic_/멘션)을 그대로
+                # 렌더한다. blocks 를 섞지 않아 크기 한계/파싱 왜곡 문제가 없다.
+                client.chat_postMessage(channel=dest, text=delivery_text)
+            except Exception as exc:
+                logger.exception(f"forward delivery failed: {exc}")
+                client.chat_postEphemeral(
+                    channel=channel_id, user=user_id,
+                    text=f"{target_display} 에게 발송 실패: {exc} :hamster:",
+                )
+                return
+            try:
+                client.chat_update(
+                    channel=channel_id,
+                    ts=msg_ts,
+                    text=f"전달 완료 — {rid}",
+                    blocks=[{
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": (
+                                f"✅ {target_display} 에게 발송 완료!\n"
+                                f"요청 `{rid}` 처리 끝 :hamster:"
+                            ),
+                        },
+                    }],
+                )
+            except Exception as exc:
+                logger.warning(f"forward preview update failed: {exc}")
+        except Exception as exc:
+            logger.exception(f"forward_confirm failed: {exc}")
+
+    @app.action("forward_cancel")
+    def handle_forward_cancel(ack, body, client, logger):
+        """'취소' 클릭 — pending 삭제 + 미리보기 업데이트."""
+        ack()
+        try:
+            user_id = (body.get("user", {}).get("id") or "").strip()
+            rid = (body.get("actions", [{}])[0].get("value") or "").strip()
+            channel_id = (body.get("channel", {}).get("id") or "").strip()
+            msg_ts = (body.get("message", {}).get("ts") or "").strip()
+            state = forward_engine.pop_forward(rid)
+            if state and state.get("sender_user_id") != user_id:
+                forward_engine._PENDING_FORWARDS[rid] = state
+                return
+            try:
+                client.chat_update(
+                    channel=channel_id,
+                    ts=msg_ts,
+                    text=f"전달 요청 #{rid} 취소됨",
+                    blocks=[{
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"❌ 요청 #{rid} 을 취소했다 :hamster:",
+                        },
+                    }],
+                )
+            except Exception as exc:
+                logger.warning(f"forward cancel update failed: {exc}")
+        except Exception as exc:
+            logger.exception(f"forward_cancel failed: {exc}")
 
     @app.action("direct_send_approve")
     def handle_direct_send_approve(ack, body, client, logger):

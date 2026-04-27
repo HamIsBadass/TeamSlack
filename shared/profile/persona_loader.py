@@ -21,10 +21,18 @@ class Persona:
     emoji: str
     role: str
     voice_rules: str
+    # 임곰(오케스트레이터)에게 요청을 넘길 때 쓰는 첫 문장 템플릿. "{subject}" 슬롯이
+    # 실제 요청 내용으로 치환된다. 봇마다 말투가 조금씩 달라도 복종 어감을 유지.
+    orchestrator_request_prefix: str = "임곰님, {subject} 승낙 부탁드립니다."
 
     def header_label(self) -> str:
         """Slack-friendly header e.g. ':broom: 리바이 (meeting_bot)'."""
         return f"{self.emoji} {self.display_name} ({self.persona_id})"
+
+    def orchestrator_request(self, subject: str) -> str:
+        """페르소나 prefix 를 subject 로 채워 반환."""
+        template = self.orchestrator_request_prefix or "임곰님, {subject} 승낙 부탁드립니다."
+        return template.replace("{subject}", subject)
 
 
 _CACHE: Dict[str, Persona] = {}
@@ -73,12 +81,14 @@ def _parse(path: Path) -> Persona:
     elif common:
         voice = common
 
+    prefix = meta.get("orchestrator_request_prefix", "").strip()
     return Persona(
         persona_id=meta["persona_id"],
         display_name=meta["display_name"],
         emoji=meta["emoji"],
         role=meta["role"],
         voice_rules=voice,
+        orchestrator_request_prefix=prefix or "임곰님, {subject} 승낙 부탁드립니다.",
     )
 
 
