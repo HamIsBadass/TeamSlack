@@ -4,6 +4,7 @@
 
 ## 아키텍처 & 계약
 
+- [architecture-overview.md](architecture-overview.md) — **현재 가동 시스템 맵** (실제 구현 기준)
 - [state-machine.md](state-machine.md) — 요청 라이프사이클 상태 10개와 전이 규칙
 - [request-schema.md](request-schema.md) — 요청 추적 필드 정의
 - [db-schema.md](db-schema.md) — ERD + 테이블 정의 (참고: 현재 구현은 in-memory dict, SQLAlchemy 모델은 [shared/models.py](../shared/models.py)에 정의만 존재)

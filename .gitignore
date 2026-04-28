@@ -152,3 +152,6 @@ apps/personal-bot/fortune_profiles.json
 
 # Forward opt-out list (user preference, treats Slack user_ids as private).
 apps/slack-bot/forward_blocklist.json
+
+# Personal-bot 일간 활동 비용 로그 (월간 누적용, 운영 데이터)
+apps/personal-bot/daily_cost_log.json

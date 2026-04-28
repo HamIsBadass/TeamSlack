@@ -31,6 +31,7 @@ from shared.utils import parse_psearch_input, select_perplexity_model, select_ge
 from shared.profile import get_persona
 from shared.api_cost_tracker import get_cost_tracker
 
+import activity_logger  # noqa: E402  — same-directory module
 import fortune_engine  # noqa: E402  — same-directory module
 import forward_engine  # noqa: E402  — same-directory module
 import hanriver_engine  # noqa: E402  — same-directory module
@@ -62,12 +63,14 @@ def _record_llm_cost_tokens(
     if tokens <= 0:
         return
     try:
-        _COST_TRACKER.record_api_call(
+        result = _COST_TRACKER.record_api_call(
             api_name=api_name,
             cost_or_tokens=float(tokens),
             user_id=user_id or None,
             metadata=metadata or {},
         )
+        # 일간 다이제스트용 누계 (재기동/이월 보존)
+        activity_logger.record_cost((result or {}).get("cost_usd", 0.0))
     except Exception as exc:
         logger.debug("cost tracker token record failed: %s", exc)
 
@@ -90,6 +93,7 @@ def _record_llm_cost_usd(
             user_id=user_id or None,
             metadata=metadata or {},
         )
+        activity_logger.record_cost(usd)
     except Exception as exc:
         logger.debug("cost tracker usd record failed: %s", exc)
 
@@ -1608,36 +1612,42 @@ def _dispatch_skill_intent(
     Fortune is DM-only (interactive registration) and is NOT handled here.
     """
     if subway_engine.is_subway_query(text):
+        activity_logger.record_intent(user_id, "지하철")
         _run_skill_with_status(
             channel_id, client, "지하철 도착 정보 조회 중입니다...",
             lambda: subway_engine.build_subway_reply(text), user_id=user_id,
         )
         return True
     if stock_engine.is_korean_stock_query(text):
+        activity_logger.record_intent(user_id, "주식")
         _run_skill_with_status(
             channel_id, client, "국내 주식 시세 조회 중입니다...",
             lambda: stock_engine.build_korean_stock_reply(text), user_id=user_id,
         )
         return True
     if realestate_engine.is_real_estate_query(text):
+        activity_logger.record_intent(user_id, "부동산")
         _run_skill_with_status(
             channel_id, client, "부동산 실거래 조회 중입니다...",
             lambda: realestate_engine.build_real_estate_reply(text), user_id=user_id,
         )
         return True
     if srt_engine.is_srt_query(text):
+        activity_logger.record_intent(user_id, "SRT")
         _run_skill_with_status(
             channel_id, client, "SRT 열차 조회 중입니다...",
             lambda: srt_engine.build_srt_reply(text), user_id=user_id,
         )
         return True
     if ktx_engine.is_ktx_query(text):
+        activity_logger.record_intent(user_id, "KTX")
         _run_skill_with_status(
             channel_id, client, "KTX 열차 조회 중입니다...",
             lambda: ktx_engine.build_ktx_reply(text), user_id=user_id,
         )
         return True
     if hanriver_engine.is_han_river_query(text):
+        activity_logger.record_intent(user_id, "한강수위")
         _run_skill_with_status(
             channel_id, client, "한강 수위 조회 중입니다...",
             lambda: hanriver_engine.build_han_river_reply(text), user_id=user_id,
@@ -1651,6 +1661,7 @@ def _dispatch_skill_intent(
         # weather intent 감지됐지만 proxy 미설정/미지원 등 None 반환 시
         # caller 가 일반 검색/대화 경로로 fall through 하도록 False 반환.
         if result is not None:
+            activity_logger.record_intent(user_id, "날씨")
             return True
     return False
 
@@ -3773,6 +3784,16 @@ def build_app() -> App:
             if text.startswith("/"):
                 return
 
+            # [A] 실시간 미러 — owner 가 다른 사용자의 DM 입력을 코드 블록으로 즉시 본다.
+            # 자동 만료일(_MIRROR_EXPIRY) 이후엔 no-op.
+            activity_logger.mirror_to_owner(
+                client,
+                sender_user_id=user_id,
+                owner_user_id=PERSONAL_BOT_OWNER_USER_ID,
+                text=text,
+                channel_id=channel_id,
+            )
+
             recent_context = _build_recent_dm_context(
                 client,
                 channel_id=channel_id,
@@ -4044,6 +4065,7 @@ def build_app() -> App:
                         "직전 봇 응답을 못 찾았다! 전달할 내용이 DM 에 있어야 한다 :hamster:"
                     ))
                     return
+                activity_logger.record_forward(user_id, target_display)
                 rid = forward_engine.queue_forward(
                     sender_user_id=user_id,
                     target_type=target_type,
@@ -4075,6 +4097,7 @@ def build_app() -> App:
             # Fortune query: intercept before weather/search. No proxy dependency.
             # Unregistered target → start interactive registration instead.
             if fortune_engine.is_fortune_query(text):
+                activity_logger.record_intent(user_id, "운세")
                 target_name = fortune_engine.extract_fortune_target(text)
                 slack_matched_key: Optional[str] = None
 
@@ -4130,6 +4153,9 @@ def build_app() -> App:
 
             use_search_engine = _looks_like_search_request(text)
             status_text = "검색 중입니다..." if use_search_engine else "답변 생성 중입니다..."
+            activity_logger.record_intent(
+                user_id, "검색" if use_search_engine else "DM 채팅",
+            )
 
             status_ts = ""
             try:
@@ -4860,6 +4886,12 @@ def build_app() -> App:
 def main() -> None:
     app_token = _required_env("SLACK_APP_TOKEN")
     app = build_app()
+
+    # [B] 일간 다이제스트 스케줄러 — 매일 19:00 KST 에 owner DM 으로 활동 보고 발송.
+    # PERSONAL_BOT_OWNER_USER_ID 미설정 시 no-op.
+    activity_logger.start_digest_scheduler(
+        app.client, PERSONAL_BOT_OWNER_USER_ID, hour=19, minute=0,
+    )
 
     logger.info("Starting Personal Bot Socket Mode handler")
     SocketModeHandler(app, app_token).start()
